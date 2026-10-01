@@ -209,7 +209,7 @@ bili-comment-keeper/
 
 ## 八、开源协议
 
-[MIT License](LICENSE) —— 随便用，随便改，随便分发。
+[MIT License](LICENSE)
 
 ## 九、免责声明
 
