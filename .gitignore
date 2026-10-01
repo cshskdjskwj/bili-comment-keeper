@@ -1,0 +1,22 @@
+# ---- 系统 / 编辑器 ----
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# ---- 打包扩展时生成，千万不要提交 ----
+# Chrome 的「打包扩展程序」会生成 .crx 和私钥 .pem。
+# 私钥一旦泄露，任何人都能冒用你的身份给别人推送扩展更新。
+*.pem
+*.crx
+*.zip
+
+# ---- 依赖 / 构建产物（本扩展零依赖，留着以防以后加）----
+node_modules/
+dist/
+
+# ---- 本地临时文件 ----
+*.bak
+*.log
+bili-comment-keeper-v*.zip

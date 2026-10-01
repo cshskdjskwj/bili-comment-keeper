@@ -1,0 +1,22 @@
+# 告诉编辑器这个项目的统一风格，避免不同人提交出满屏无关 diff
+# 文档：https://editorconfig.org
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# Markdown 里行尾两个空格是有意义的换行，不能裁掉
+[*.md]
+trim_trailing_whitespace = false
+
+[*.{json,yml,yaml}]
+indent_size = 2
+
+[*.{ps1,bat,cmd}]
+end_of_line = crlf

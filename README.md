@@ -1,8 +1,14 @@
 # B站评论管家（BiliComment Keeper）
 
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Manifest](https://img.shields.io/badge/manifest-v3-brightgreen.svg)](manifest.json)
+[![Chrome](https://img.shields.io/badge/chrome-111%2B-yellow.svg)](#一安装chrome--edge)
+[![Dependencies](https://img.shields.io/badge/dependencies-0-success.svg)](manifest.json)
+[![检查](https://github.com/cshskdjskwj/bili-comment-keeper/actions/workflows/check.yml/badge.svg)](https://github.com/cshskdjskwj/bili-comment-keeper/actions/workflows/check.yml)
+
 弥补 B 站没有「查看自己的评论历史」的功能。
 
-**它做两件事：**
+**它做三件事：**
 
 1. **自动记录** —— 你在 B 站发出任意一条评论（含楼中楼回复），扩展会立刻拿到这条评论的永久链接，
    存进浏览器里自动创建的目录 `其他收藏夹 / 评论管家 / B站我的评论`，标题统一格式：
@@ -195,8 +201,12 @@ bili-comment-keeper/
 ├── popup/                   工具栏弹窗（计数、最近记录、入口）
 ├── clean/                   一键清除面板
 ├── options/                 设置页
+├── .github/workflows/       持续集成：每次推送自动校验语法与清单
 ├── README.md
+├── CHANGELOG.md             版本变更记录
 ├── LICENSE                  MIT
+├── .editorconfig            统一编辑器风格
+├── .gitattributes           统一换行符（LF）
 └── .gitignore
 ```
 
@@ -209,7 +219,9 @@ bili-comment-keeper/
 
 ## 八、开源协议
 
-[MIT License](LICENSE)
+[MIT License](LICENSE) —— 随便用，随便改，随便分发。
+
+版本变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 九、免责声明
 
