@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>一键清除 · B站评论管家</title>
+  <link rel="stylesheet" href="../src/ui.css">
+</head>
+<body class="page">
+
+  <header class="hd">
+    <div class="hd-t">
+      <span class="logo">🧹</span>
+      <h1>一键清除</h1>
+    </div>
+    <div class="hd-s" id="folders"></div>
+  </header>
+
+  <section class="cards">
+    <div class="card"><b id="stat-total">0</b><span>勾选待删</span></div>
+    <div class="card ok"><b id="stat-ok">0</b><span>本次成功</span></div>
+    <div class="card bad"><b id="stat-fail">0</b><span>本次失败</span></div>
+    <div class="card"><b id="stat-left">0</b><span>目录剩余</span></div>
+  </section>
+
+  <section class="bar">
+    <button id="btn-start" class="btn primary">开始删除</button>
+    <button id="btn-stop" class="btn danger" disabled>停止</button>
+    <button id="btn-retry" class="btn ghost">重试失败项</button>
+    <button id="btn-reload" class="btn ghost">刷新列表</button>
+  </section>
+
+  <div class="progress"><i id="progress-inner"></i></div>
+  <div id="hint" class="hint">删除会逐条调用 B 站官方删除接口（每条之间有 1.5~4 秒随机间隔，避免触发风控）。删除成功后，对应书签会从「B站我的评论」移动到「B站已删除评论」，链接原样保留。</div>
+
+  <section class="list-wrap">
+    <div class="list-hd">
+      <label><input type="checkbox" id="check-all" checked> 全选</label>
+      <span id="sel-count"></span>
+    </div>
+    <div id="list" class="list"></div>
+  </section>
+
+  <section class="list-wrap archive">
+    <div class="list-hd">
+      <span>已删除归档 · <b id="arc-count">0</b> 条</span>
+      <span class="arc-path" id="arc-path"></span>
+      <span class="spacer"></span>
+      <span id="purge-confirm" class="purge-confirm hide">
+        清空后无法恢复
+        <button id="btn-purge-yes" class="btn mini danger">确定清空</button>
+        <button id="btn-purge-no" class="btn mini ghost">取消</button>
+      </span>
+      <button id="btn-purge" class="btn mini danger">一键清空</button>
+    </div>
+    <div id="arc-list" class="arc-list"></div>
+  </section>
+
+  <details class="log-wrap">
+    <summary>运行日志</summary>
+    <pre id="log"></pre>
+  </details>
+
+  <script type="module" src="clean.js"></script>
+</body>
+</html>

@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>设置 · B站评论管家</title>
+  <link rel="stylesheet" href="../src/ui.css">
+</head>
+<body class="page">
+
+  <header class="hd">
+    <div class="hd-t">
+      <span class="logo">⚙️</span>
+      <h1>B站评论管家 · 设置</h1>
+    </div>
+    <div class="hd-s" id="ver"></div>
+  </header>
+
+  <div class="hint">
+    记录原理：扩展在 B 站页面后台偷听「发表评论」这个请求的返回值，拿到评论 id 后拼出和你点「复制评论链接」完全一样的地址，再写进书签栏。
+    全程不改动你的评论内容，也不会额外发任何请求。
+  </div>
+
+  <div class="form">
+    <div class="field">
+      <label>自动记录评论</label>
+      <label class="switch"><input type="checkbox" id="enabled"><span></span></label>
+      <span class="desc">关闭后发评论不会再写入书签</span>
+    </div>
+
+    <div class="field">
+      <label>放在哪里</label>
+      <select id="rootParent">
+        <option value="2">其他收藏夹</option>
+        <option value="1">书签栏</option>
+      </select>
+      <span class="desc">推荐放「其他收藏夹」，不占用书签栏位置</span>
+    </div>
+
+    <div class="field">
+      <label>外层文件夹名</label>
+      <input type="text" id="containerFolder" maxlength="40">
+      <span class="desc">两个评论目录都装进它里面；留空则直接放在上面选的位置下</span>
+    </div>
+
+    <div class="field">
+      <label>存活评论目录名</label>
+      <input type="text" id="folderActive" maxlength="40">
+      <span class="desc">保存在外层文件夹里面</span>
+    </div>
+
+    <div class="field">
+      <label>已删除评论目录名</label>
+      <input type="text" id="folderDeleted" maxlength="40">
+      <span class="desc">删除成功后，书签会原样移动到这里</span>
+    </div>
+
+    <div class="field">
+      <label>标题里带评论正文</label>
+      <label class="switch"><input type="checkbox" id="recordContent"><span></span></label>
+      <span class="desc">形如「[2026-01-30 12:34] BV1xx411c7mD · 哈哈哈哈这个太好笑了」</span>
+    </div>
+
+    <div class="field">
+      <label>剪贴板兜底</label>
+      <label class="switch"><input type="checkbox" id="clipboardFallback"><span></span></label>
+      <span class="desc">手动点 B 站「复制评论链接」时也补记一笔。注意：你复制<b>别人</b>的评论链接分享时也会被记进来，所以默认关闭</span>
+    </div>
+
+    <div class="field">
+      <label>删除间隔（毫秒）</label>
+      <input type="number" id="minDelay" min="300" step="100" style="width:110px">
+      <span class="desc">~</span>
+      <input type="number" id="maxDelay" min="300" step="100" style="width:110px">
+      <span class="desc">每条之间随机等待，太快容易触发风控（-509）</span>
+    </div>
+  </div>
+
+  <section class="bar" style="margin-top:16px">
+    <button id="btn-save" class="btn primary">保存设置</button>
+    <button id="btn-reset" class="btn ghost">恢复默认</button>
+    <span id="saved" class="saved"></span>
+  </section>
+
+  <div class="tip" id="index-info"></div>
+
+  <div class="tip">
+    小提示：<br>
+    · 改了目录名之后，旧目录里的书签不会自动搬过去，需要你手动拖一下。<br>
+    · 删评论靠的是 B 站官方接口 <code>x/v2/reply/del</code>，只能删自己的评论；如果登录态过期会直接停下来告诉你。<br>
+    · 书签里的链接就是评论的永久定位地址，点开可以直接跳到那条评论。
+  </div>
+
+  <script type="module" src="options.js"></script>
+</body>
+</html>

@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "B站评论管家",
+  "version": "1.0.0",
+  "description": "自动记录自己在 B 站发布的每条评论链接并存入书签栏，支持一键批量删除并把已删链接原样归档。",
+  "minimum_chrome_version": "111",
+
+  "permissions": [
+    "bookmarks",
+    "storage",
+    "scripting"
+  ],
+
+  "host_permissions": [
+    "https://*.bilibili.com/*"
+  ],
+
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "B站评论管家"
+  },
+
+  "options_page": "options/options.html",
+
+  "content_scripts": [
+    {
+      "matches": ["https://*.bilibili.com/*"],
+      "js": ["src/content.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://*.bilibili.com/*"],
+      "js": ["src/recorder-main.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    }
+  ]
+}
