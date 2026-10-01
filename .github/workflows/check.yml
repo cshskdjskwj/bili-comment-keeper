@@ -1,0 +1,55 @@
+name: 检查
+
+# 每次推送和 PR 都自动跑一遍，防止把语法错误提上来
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  syntax:
+    name: 语法与清单校验
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 校验 manifest.json 是否合法
+        run: |
+          node -e "JSON.parse(require('fs').readFileSync('manifest.json','utf8'))"
+          echo "manifest.json 合法"
+
+      - name: 校验所有 JS 文件语法
+        run: |
+          for f in $(git ls-files '*.js'); do
+            cp "$f" /tmp/check.mjs
+            node --check /tmp/check.mjs
+            echo "OK  $f"
+          done
+
+      - name: 确认清单里引用的文件都存在
+        run: |
+          missing=0
+          for f in $(node -e "
+            const m = JSON.parse(require('fs').readFileSync('manifest.json','utf8'));
+            const out = [];
+            out.push(m.background.service_worker);
+            out.push(m.action.default_popup);
+            if (m.options_page) out.push(m.options_page);
+            (m.content_scripts || []).forEach(cs => (cs.js || []).forEach(j => out.push(j)));
+            console.log([...new Set(out)].join('\n'));
+          "); do
+            if [ -f "$f" ]; then
+              echo "存在  $f"
+            else
+              echo "缺失  $f"
+              missing=1
+            fi
+          done
+          exit $missing
