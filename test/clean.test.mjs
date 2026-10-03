@@ -809,6 +809,98 @@ await test('两个视图的容器都只靠 hide 类切换，没有任何一个�
   assert.ok(els.get('view-main') && els.get('view-import'));
 });
 
+await test('评论区被关闭（12061）→ 查不到，不能当成"没了"', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.fetch = async () => ({
+    status: 200,
+    text: async () => JSON.stringify({ code: 12061, message: '当前页面评论功能已关闭' })
+  });
+
+  const r = await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '999' });
+  assert.equal(r.state, 'unreachable');
+  assert.match(r.message, /评论功能已经关闭/);
+  assert.ok(!r.transport, '这是接口明确答了，不是链路不通');
+});
+
+await test('认得出"评论功能已关闭"的各种说法（按文案兜底）', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  for (const msg of ['当前页面评论功能已关闭', '评论区已关闭', '评论已关闭']) {
+    sandbox.fetch = async () => ({
+      status: 200, text: async () => JSON.stringify({ code: 99999, message: msg })
+    });
+    const r = await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '999' });
+    assert.equal(r.state, 'unreachable', `「${msg}」该判成查不到`);
+  }
+});
+
+await test('链路不通会标记 transport —— 这才是该中止整轮的理由', async () => {
+  const { sandbox } = await makeSandbox(async () => { throw new Error('注入失败'); });
+  sandbox.fetch = async () => { throw new Error('网络断了'); };
+  sandbox.window.__bcNativeFetch = sandbox.fetch;
+
+  const r = await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '999' });
+  assert.equal(r.transport, true);
+  assert.equal(r.state, 'unknown');
+});
+
+console.log('\n— 巡检：不该因为第一条判不出结论就整轮中止 —');
+
+await test('待检查的第一条是"评论功能已关闭"时，后面几条照样要检查（用户反馈的"按键失效"）', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }], {
+    seed: seedLibrary([
+      // ctime 最大的排在最前，让它就是那条"评论区关了"的
+      libItem('3', 'unknown', { ctime: 1700000300 }),
+      libItem('2', 'unknown', { ctime: 1700000200 }),
+      libItem('1', 'unknown', { ctime: 1700000100 })
+    ])
+  });
+
+  sandbox.fetch = async (url) => {
+    if (url.indexOf('root=3') >= 0) {
+      return { status: 200, text: async () => JSON.stringify({ code: 12061, message: '当前页面评论功能已关闭' }) };
+    }
+    if (url.indexOf('root=2') >= 0) {
+      return { status: 200, text: async () => JSON.stringify({ code: 12006, message: '没有该评论' }) };
+    }
+    return { status: 200, text: async () => JSON.stringify({ code: 0, data: { root: { rpid: 1 } } }) };
+  };
+
+  await sandbox.probeAicuAlive();
+
+  const lib = await sandbox.getLibrary();
+  assert.equal(lib.items['3'].state, 'unreachable', '第一条该判成「查不到」');
+  assert.equal(lib.items['2'].state, 'gone', '第二条不该因为第一条没结论就被跳过');
+  assert.equal(lib.items['1'].state, 'live', '第三条同理 —— 整轮必须跑完');
+});
+
+await test('链路真的不通时，仍然中止整轮（不能每条都白撞一遍）', async () => {
+  const { sandbox } = await makeSandbox(async () => { throw new Error('注入失败'); }, {
+    seed: seedLibrary([libItem('1', 'unknown'), libItem('2', 'unknown')])
+  });
+  sandbox.fetch = async () => { throw new Error('网络断了'); };
+  sandbox.window.__bcNativeFetch = sandbox.fetch;
+
+  await sandbox.probeAicuAlive();
+
+  const lib = await sandbox.getLibrary();
+  assert.equal(lib.items['1'].state, 'unknown', '链路不通就不该乱记结论');
+  assert.equal(lib.items['2'].state, 'unknown');
+});
+
+await test('「已检查」是除"未检查"之外的全部', async () => {
+  const { sandbox, els } = await makeSandbox(async () => [{ result: undefined }], {
+    seed: seedLibrary([
+      libItem('1', 'live'), libItem('2', 'gone'),
+      libItem('3', 'unreachable'), libItem('4', 'unknown')
+    ])
+  });
+
+  await sandbox.refreshLibrary();
+  const bar = els.get('lib-states').innerHTML;
+  assert.match(bar, /已检查 <b>3<\/b>/, `实际：${bar}`);
+  assert.match(bar, /未检查 <b>1<\/b>/);
+});
+
 /* ---------------------------------------------------------------- 汇总 */
 
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项\n`);

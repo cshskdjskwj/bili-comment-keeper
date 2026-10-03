@@ -700,17 +700,26 @@ async function probeAicuAlive() {
   // 不预先开标签页、也不做登录自检：
   // 探测的接口是公开只读的（不需要登录），而且优先让扩展自己直发 ——
   // 只有直发被反爬拦了才会去借 bilibili 标签页，那一步由取数据的地方按需触发。
-  // 先单独试一条，把结果当场说出来 —— 不要让人对着进度等半天才发现根本不通。
+  // 先单独试一条。
+  //
+  // **只有"链路本身不通"才中止整轮**。单条问不出结果是这一条的事 ——
+  // 比如它的页面评论功能关了、视频不可访问，这些都是**合法的结论**，
+  // 不该因此让整个按钮从此点不动。
+  // （踩过的坑：待检查列表最前面几条恰好都是"评论功能已关闭"，于是每次点按钮
+  //   都只跑完试运行就放弃，看起来就是"按键失效"。）
   const firstTry = await withTimeout(checkAliveOne(todo[0]), 20000,
-    { alive: null, message: '第一条就超时（20 秒）' });
+    { state: 'unknown', alive: null, message: '第一条就超时（20 秒）', transport: true });
 
-  log(`探测试运行：第 1 条 rpid ${todo[0].rpid} → ` +
-    (firstTry.alive === true ? '还在' : firstTry.alive === false ? '已经没了' : '没问出结果')
-    + (firstTry.message ? '（' + firstTry.message + '）' : ''));
+  const stateText0 = {
+    live: '还在', gone: '已经没了', unreachable: '查不到', unknown: '没问出结果'
+  }[firstTry.state] || '没问出结果';
 
-  if (firstTry.alive === null) {
+  log(`探测试运行：第 1 条 rpid ${todo[0].rpid} → ${stateText0}` +
+    (firstTry.message ? '（' + firstTry.message + '）' : ''));
+
+  if (firstTry.transport) {
     setAicuProbing(false);
-    setAicuHint('探测没有开始：第一条就没问出结果。' + (firstTry.message || '') +
+    setAicuHint('探测没有开始：取数据的链路不通。' + (firstTry.message || '') +
       '　把 bilibili 标签页刷新一下（F5）再试，或者先随便打开一个 bilibili 页面。', 'bad');
     return;
   }
@@ -1062,12 +1071,16 @@ const LIB_STATE_TAG = {
 
 const LIB_FILTERS = [
   { id: 'all', label: '全部' },
+  { id: 'checked', label: '已检查' },
   { id: 'live', label: '还在' },
   { id: 'gone', label: '已没了' },
   { id: 'deleted', label: '已删除' },
   { id: 'unreachable', label: '查不到' },
   { id: 'unknown', label: '未检查' }
 ];
+
+/** 「已检查」不是库里真实的一种状态，而是其余四态的并集；查询时翻译成它们 */
+const CHECKED_STATES = ['live', 'gone', 'deleted', 'unreachable'];
 
 /** 库列表里的一行 */
 function libRowHtml(it) {
@@ -1113,8 +1126,10 @@ function libPagerHtml(total) {
 
 function renderLibFilters(s) {
   const counts = {
-    all: s.total, live: s.live, gone: s.gone,
-    deleted: s.deleted, unknown: s.unknown, unreachable: s.unreachable
+    all: s.total,
+    checked: s.total - s.unknown,          // 「已检查」= 除"未检查"之外的全部
+    live: s.live, gone: s.gone, deleted: s.deleted,
+    unknown: s.unknown, unreachable: s.unreachable
   };
   $('lib-states').innerHTML = LIB_FILTERS.map(function (f) {
     const on = (f.id === 'all' && !libStates.length) || (libStates.length === 1 && libStates[0] === f.id);
@@ -1145,7 +1160,7 @@ async function refreshLibrary() {
 
   const bits = [];
   if (s.uid) bits.push('UID ' + s.uid);
-  if (s.totalOnSite) bits.push('站上共 ' + s.totalOnSite + ' 条');
+  if (s.totalOnSite > 0) bits.push('站上共 ' + s.totalOnSite + ' 条');
   if (s.videos) bits.push(s.videos + ' 个视频' + (s.titled < s.videos ? `（已缓存 ${s.titled} 个标题）` : ''));
   if (s.probedAt) bits.push('上次巡检 ' + fmtTime(s.probedAt));
   $('lib-updated').textContent = bits.join('　·　');
@@ -1154,7 +1169,8 @@ async function refreshLibrary() {
 
   const r = await queryLib({
     q: libQ,
-    states: libStates,
+    // 「已检查」翻译成其余四态；库里并没有 checked 这个状态
+    states: (libStates.length === 1 && libStates[0] === 'checked') ? CHECKED_STATES : libStates,
     sort: libSort,
     offset: libPage * LIB_PAGE_SIZE,
     limit: LIB_PAGE_SIZE
@@ -1701,6 +1717,9 @@ function safeJson(text) {
  * 注意 alive=true 时还要看 rootRpid 是不是等于被查的那条 —— 不等于说明这是
  * **楼中楼**，B 站把我们解析到了所属的根评论，还得再去会话里确认本人。
  */
+/** 「这个页面的评论功能已经关了」的各种说法 —— 按 code 按文案都认一下 */
+const COMMENT_CLOSED_RE = /评论功能已关闭|评论区已关闭|评论已关闭|comment.{0,4}clos/i;
+
 function interpretReplyCheck(json) {
   if (!json || typeof json.code !== 'number') {
     return { alive: null, message: '接口返回的不是数据（多半被反爬拦了）' };
@@ -1714,6 +1733,13 @@ function interpretReplyCheck(json) {
     return {
       alive: null, unreachable: true, code: -404,
       message: '视频/评论区访问不到（' + (json.message || '啥都木有') + '），没法确认这条还在不在'
+    };
+  }
+  // UP 主关掉了这个页面的评论区。评论可能还在，只是这个入口查不到 —— 同样不能当它没了。
+  if (json.code === 12061 || COMMENT_CLOSED_RE.test(String(json.message || ''))) {
+    return {
+      alive: null, unreachable: true, code: json.code,
+      message: '这个页面的评论功能已经关闭（' + (json.message || '') + '），没法确认这条还在不在'
     };
   }
   if (json.code !== 0) {
@@ -1926,7 +1952,13 @@ async function findInThread(item, rootId) {
 
 /**
  * 判断一条评论还在不在。
- * 返回 { state, alive, message }：state 是四态里的一种（含查不到），alive 是给老调用方的兼容字段。
+ *
+ * 返回 { state, alive, message, transport }：
+ *   state     四态里的一种（含查不到）
+ *   alive     给老调用方的兼容字段
+ *   transport **是不是"链路本身不通"**（取数失败/被拦/超时），
+ *             而不是"接口答了但答不出结论"。这两者要分开：
+ *             单条问不出结果是这一条的事，链路不通才是整轮该停的理由。
  */
 async function checkAliveOne(item) {
   const done = a => ({
@@ -1938,7 +1970,9 @@ async function checkAliveOne(item) {
   });
 
   const first = await fetchReplyRaw({ type: item.type, oid: item.oid, root: item.rpid, pn: 1, ps: 1 });
-  if (first.error) return done({ alive: null, message: first.error });
+  if (first.error) {
+    return Object.assign(done({ alive: null, message: first.error }), { transport: true });
+  }
 
   const a = interpretReplyCheck(first.json);
   if (a.alive !== true) return done(a);
