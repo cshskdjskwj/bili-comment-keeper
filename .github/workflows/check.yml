@@ -27,11 +27,16 @@ jobs:
 
       - name: 校验所有 JS 文件语法
         run: |
-          for f in $(git ls-files '*.js'); do
+          for f in $(git ls-files '*.js' '*.mjs'); do
             cp "$f" /tmp/check.mjs
             node --check /tmp/check.mjs
             echo "OK  $f"
           done
+
+      - name: 跑回归测试（云同步分片 + 接线检查）
+        run: |
+          node test/sync-index.test.mjs
+          node test/wiring.test.mjs
 
       - name: 确认清单里引用的文件都存在
         run: |
