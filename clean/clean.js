@@ -19,7 +19,21 @@ const STATE_CLS = { done: 'ok', failed: 'bad', working: 'run' };
 async function mainWorldDelete(arg) {
   const done = out => {
     out.requestId = arg.requestId;
+
+    // 回传通道 ①（主）：把结果挂在页面的 window 上，控制台自己回来取。
+    // 这条不经过内容脚本，所以「标签页是装扩展之前打开的、内容脚本已失效」也不影响。
+    try {
+      if (!window.__bcDelResults) window.__bcDelResults = {};
+      const keys = Object.keys(window.__bcDelResults);
+      if (keys.length > 200) {            // 别在页面上越堆越多
+        for (let i = 0; i < keys.length - 100; i++) delete window.__bcDelResults[keys[i]];
+      }
+      window.__bcDelResults[arg.requestId] = out;
+    } catch (e) { /* 忽略 */ }
+
+    // 回传通道 ②（兜底）：老路子的 postMessage，交给隔离世界的内容脚本转发
     try { window.postMessage({ __bcDeleterResult: out }, '*'); } catch (e) { /* 忽略 */ }
+
     return out;
   };
 
@@ -51,6 +65,16 @@ async function mainWorldDelete(arg) {
 
 const pending = new Map();   // requestId -> resolve，等网页用 postMessage 回传结果
 const aidCache = new Map();  // bvid -> aid
+
+/**
+ * 单条删除的总超时（毫秒）。
+ * 用 `var` 是故意的：它会挂到全局对象上，测试里可以调小它来验证「超时后给出可读原因」，
+ * 否则那一条用例要真等 23 秒。生产代码只读不写。
+ */
+var BC_DELETE_TIMEOUT_MS = 23000;
+
+/** 自检里等「兜底通道回话」的时长；同样用 var 方便测试调小。 */
+var BC_PREFLIGHT_MS = 6000;
 
 let running = false, stopRequested = false;
 let workerTabId = null, workerCreated = false;
@@ -755,20 +779,60 @@ async function acquireWorkerTab() {
   return await getWorkerTab();
 }
 
-/** 注入主世界脚本并等结果（executeScript 的返回值可用就优先用，否则等 postMessage 回传） */
+/**
+ * 注入主世界脚本删一条，然后等结果。
+ *
+ * 结果有两条回传通道，谁先到用谁：
+ *   ① **控制台自己去页面取**（主）：注入的脚本把结果挂在 `window.__bcDelResults` 上，
+ *      我们隔一会儿用 executeScript 回去读一次。**完全不经过内容脚本**。
+ *   ② 老路子：页面 postMessage → 隔离世界的内容脚本转发（兜底）。
+ *
+ * 为什么要把 ① 做成主通道：② 依赖「那个 bilibili 标签页里跑着当前版本的内容脚本」。
+ * 如果标签页是装/更新扩展之前就开着的，内容脚本已经失效 —— 于是每条都静静地等满
+ * 超时，一千多条就是八个多小时，而且看不出哪里坏了。① 没有这个依赖。
+ */
 async function deleteOne(tabId, target) {
   const requestId = 'req-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+  const OVERALL_MS = Number(BC_DELETE_TIMEOUT_MS) || 23000;
 
+  // 通道 ①：轮询页面上的结果（超时不 resolve，交给总超时收尾）
+  const viaPoll = (async function () {
+    const deadline = Date.now() + OVERALL_MS;
+    while (Date.now() < deadline) {
+      await sleep(500);
+      let out;
+      try {
+        out = await chrome.scripting.executeScript({
+          target: { tabId: tabId },
+          world: 'MAIN',
+          func: function (id) {
+            return (window.__bcDelResults && window.__bcDelResults[id]) || null;
+          },
+          args: [requestId]
+        });
+      } catch (e) {
+        // 页面被关了 / 被导航走了
+        return { ok: false, code: null, tabGone: true, message: '读取页面结果失败：' + ((e && e.message) || e) };
+      }
+      const r = out && out[0] && out[0].result;
+      if (r && r.requestId === requestId) {
+        return { ok: !!r.ok, code: r.code, message: r.message || '' };
+      }
+    }
+    return new Promise(function () { /* 永不 resolve */ });
+  })();
+
+  // 通道 ②：页面 postMessage → 内容脚本转发（同样超时不 resolve）
   const viaMessage = new Promise(function (resolve) {
     pending.set(requestId, resolve);
-    setTimeout(function () {
-      if (pending.has(requestId)) {
-        pending.delete(requestId);
-        resolve({ ok: false, code: null, message: '等待页面响应超时（25 秒）' });
-      }
-    }, 25000);
+    setTimeout(function () { pending.delete(requestId); }, OVERALL_MS);
   });
 
+  const overallTimeout = sleep(OVERALL_MS + 1500).then(function () {
+    return { ok: false, code: null, message: '等待页面响应超时（' + Math.round(OVERALL_MS / 1000) + ' 秒）' };
+  });
+
+  // 先把删除指令注入进去
   try {
     const out = await chrome.scripting.executeScript({
       target: { tabId: tabId },
@@ -776,6 +840,7 @@ async function deleteOne(tabId, target) {
       func: mainWorldDelete,
       args: [{ requestId: requestId, type: target.type, oid: target.oid, rpid: target.rpid }]
     });
+    // 同步返回（没走 async）时这里就能直接拿到结果
     const r = out && out[0] && out[0].result;
     if (r && r.requestId === requestId) {
       pending.delete(requestId);
@@ -783,10 +848,13 @@ async function deleteOne(tabId, target) {
     }
   } catch (e) {
     pending.delete(requestId);
-    // 走到这里最常见的原因是通道标签页被关掉了，标记出来交给调用方换一个重试
+    // 最常见的原因是通道标签页被关掉了，标记出来交给调用方换一个重试
     return { ok: false, code: null, tabGone: true, message: '注入网页失败：' + ((e && e.message) || e) };
   }
-  return await viaMessage;
+
+  const r = await Promise.race([viaPoll, viaMessage, overallTimeout]);
+  pending.delete(requestId);
+  return r;
 }
 
 /**
@@ -814,6 +882,70 @@ async function deleteWithRecovery(target) {
     r = await deleteOne(tabId, target);
   }
   return r;
+}
+
+/**
+ * 开工前自检：确认「注入 bilibili 页面 → 页面 postMessage → 内容脚本转发 → 控制台收到」
+ * 这条链路是通的。
+ *
+ * 为什么要专门做这件事：链上任何一环断了（最常见的是**这个 bilibili 标签页是在装/更新
+ * 扩展之前打开的，里面的内容脚本已经失效**），外在表现都是「点了删除之后一片安静」，
+ * 然后每条各自等 25 秒超时 —— 一千多条就是八个多小时，而且完全看不出哪里坏了。
+ * 先拿一条假消息跑一遍，几秒钟就能给出可操作的结论。
+ */
+async function preflight(tabId) {
+  // 第一关：能不能注入、页面里读不读得到登录态
+  let probe;
+  try {
+    probe = await chrome.scripting.executeScript({
+      target: { tabId: tabId },
+      world: 'MAIN',
+      func: function () {
+        const m = /(?:^|;\s*)bili_jct=([^;]+)/.exec(document.cookie || '');
+        return { hasJct: !!m, href: location.href, ready: document.readyState };
+      }
+    });
+  } catch (e) {
+    return { ok: false, reason: '往那个 bilibili 标签页注入脚本失败：' + ((e && e.message) || e) };
+  }
+
+  const info = probe && probe[0] && probe[0].result;
+  if (!info) return { ok: false, reason: '脚本注入进去了但没拿到返回值，那个标签页可能还没加载完。' };
+  if (!info.hasJct) {
+    return {
+      ok: false,
+      reason: '在那个 bilibili 页面里读不到 bili_jct。请确认浏览器已登录 B 站，并把那个页面刷新一下再试。'
+    };
+  }
+  log('自检 1/2：注入正常，登录态正常（' + String(info.href).slice(0, 70) + '）');
+
+  // 第二关：消息回传链路
+  const requestId = 'pre-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+  const arrived = await new Promise(function (resolve) {
+    pending.set(requestId, function () { resolve(true); });
+    setTimeout(function () {
+      if (pending.has(requestId)) { pending.delete(requestId); resolve(false); }
+    }, Number(BC_PREFLIGHT_MS) || 6000);
+
+    chrome.scripting.executeScript({
+      target: { tabId: tabId },
+      world: 'MAIN',
+      func: function (id) {
+        window.postMessage({ __bcDeleterResult: { requestId: id, ok: true, code: 0, message: '自检' } }, '*');
+      },
+      args: [requestId]
+    }).catch(function () { /* 下面按超时处理 */ });
+  });
+
+  if (!arrived) {
+    // 主通道（控制台自己去页面取结果）不走这里，所以只提示、不拦。
+    log('自检 2/2：内容脚本那条兜底通道没回应。不影响删除（主通道不走它），' +
+      '但如果这个 bilibili 标签页是装/更新扩展之前就开着的，建议刷新一下。');
+  } else {
+    log('自检 2/2：兜底通道也正常');
+  }
+
+  return { ok: true };
 }
 
 /** 把书签移进「已删除」目录；返回空串表示成功，否则返回错误说明 */
@@ -885,8 +1017,9 @@ async function start() {
   setHint('正在删除…这个面板别关。删除期间会复用一个 bilibili 标签页发请求。', '');
   setEta('');
 
+  let tabId;
   try {
-    const tabId = await acquireWorkerTab();
+    tabId = await acquireWorkerTab();
     log('请求通道：标签页 #' + tabId);
   } catch (e) {
     log('准备 bilibili 标签页失败：' + ((e && e.message) || e));
@@ -896,7 +1029,20 @@ async function start() {
     return;
   }
 
+  // 开工前自检：不然链子断了会演变成「一千多条各等 23 秒」，还看不出哪里坏了
+  setHint('正在自检：确认能注入 bilibili 页面、能读到登录态…', '');
+  const check = await preflight(tabId);
+  if (!check.ok) {
+    logError('✗ 自检没通过：' + check.reason);
+    setHint('删除没有开始。' + check.reason, 'bad');
+    running = false;
+    setUi(false);
+    setEta('');
+    return;
+  }
+
   let aborted = false;
+  let timeoutFails = 0;            // 连续「等不到页面回话」的条数
   const deletedRpids = [];         // 删成功的 rpid，最后交回后台清索引
   const deletedAicuRpids = [];     // 其中来自 aicu 导入的，要从导入清单里移除
 
@@ -954,6 +1100,18 @@ async function start() {
         it.note = explainCode(r.code, r.message);
         stats.fail++;
         logError('✗ ' + label(it) + ' 删除失败：code=' + r.code + ' ' + (r.message || ''));
+
+        // 连续几条都等不到页面回话 —— 链路断了，别再一条条空等 23 秒
+        if (/等待页面响应超时/.test(r.message || '')) {
+          if (++timeoutFails >= 3) {
+            setHint('连续 3 条都等不到 bilibili 页面回话。已中止 —— ' +
+              '把那个 bilibili 标签页刷新一下（或关掉让扩展自己开一个）再重试。', 'bad');
+            aborted = true;
+            break;
+          }
+        } else {
+          timeoutFails = 0;
+        }
       }
     }
 
