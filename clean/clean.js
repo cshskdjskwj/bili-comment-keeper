@@ -55,6 +55,7 @@ let running = false, stopRequested = false;
 let workerTabId = null, workerCreated = false;
 let settings = null, activeFolderId = null, deletedFolderId = null;
 let indexCache = {}, items = [], stats = { ok: 0, fail: 0 }, purgeTimer = null;
+let indexRefreshDone = false;   // 本轮删除里是否已经重读过索引
 
 chrome.runtime.onMessage.addListener(function (msg) {
   if (!msg) return;
@@ -210,6 +211,7 @@ async function reload() {
   }
 
   items = next;
+  stats = { ok: 0, fail: 0 };   // 刷新过列表，「本次成功/失败」不该再显示上一轮的旧数字
   render();
   if (skipped > 0) setHint(`目录里有 ${skipped} 条不是评论链接的书签，已自动跳过（不会被删除）。`, 'warn');
 }
@@ -309,7 +311,17 @@ async function resolveAid(bvid) {
 
 async function resolveTarget(it) {
   const p = it.parsed;
-  const meta = indexCache[p.rpid] || null;
+  let meta = indexCache[p.rpid] || null;
+
+  // 面板手里的索引是打开那一刻的快照。这里没命中，很可能是刚发的评论，
+  // 重新读一次再说，免得误报「缺少评论区 oid」。
+  // 每轮删除最多重读一次：索引整体可能上百 KB，几千条老记录逐条重读太浪费。
+  if (!meta && !indexRefreshDone) {
+    indexRefreshDone = true;
+    indexCache = await getIndex();
+    meta = indexCache[p.rpid] || null;
+  }
+
   let type = (meta && meta.type !== null && meta.type !== undefined) ? Number(meta.type) : null;
   let oid = (meta && meta.oid) ? String(meta.oid) : '';
 
@@ -364,6 +376,20 @@ async function getWorkerTab() {
   return tab.id;
 }
 
+/** 确保手上有一个还活着的通道标签页；被关掉就重新找一个 */
+async function acquireWorkerTab() {
+  if (workerTabId !== null) {
+    try {
+      await chrome.tabs.get(workerTabId);
+      return workerTabId;
+    } catch (e) {
+      workerTabId = null;      // 用户把它关了
+      workerCreated = false;
+    }
+  }
+  return await getWorkerTab();
+}
+
 /** 注入主世界脚本并等结果（executeScript 的返回值可用就优先用，否则等 postMessage 回传） */
 async function deleteOne(tabId, target) {
   const requestId = 'req-' + Date.now() + '-' + Math.random().toString(16).slice(2);
@@ -392,9 +418,29 @@ async function deleteOne(tabId, target) {
     }
   } catch (e) {
     pending.delete(requestId);
-    return { ok: false, code: null, message: '注入网页失败：' + ((e && e.message) || e) };
+    // 走到这里最常见的原因是通道标签页被关掉了，标记出来交给调用方换一个重试
+    return { ok: false, code: null, tabGone: true, message: '注入网页失败：' + ((e && e.message) || e) };
   }
   return await viaMessage;
+}
+
+/**
+ * 删除一条；通道标签页中途没了就自动换一个再试一次。
+ * v1.0.0 只在开跑前取一次通道，用户中途手一滑关掉那个标签页，
+ * 后面每一条都会失败——这里补上恢复能力。
+ */
+async function deleteWithRecovery(target) {
+  let tabId = await acquireWorkerTab();
+  let r = await deleteOne(tabId, target);
+
+  if (r.tabGone) {
+    log('  ↻ 请求通道标签页已失效，正在换一个…');
+    workerTabId = null;
+    workerCreated = false;
+    tabId = await acquireWorkerTab();
+    r = await deleteOne(tabId, target);
+  }
+  return r;
 }
 
 /** 把书签移进「已删除」目录；返回空串表示成功，否则返回错误说明 */
@@ -421,6 +467,29 @@ async function refreshBadge() {
   try { await chrome.runtime.sendMessage({ type: 'REFRESH_BADGE' }); } catch (e) { /* 后台可能刚好休眠 */ }
 }
 
+/**
+ * 把已删除的 rpid 交回后台清索引。
+ * 面板刻意不做「整体写回」：那会用打开面板时的旧快照，覆盖掉删除期间后台新记进来的条目。
+ * 后台联系不上时退化成现读现写，只删这几个键，语义上依然安全。
+ */
+async function forgetRpids(rpids) {
+  if (!rpids.length) return;
+
+  try {
+    await chrome.runtime.sendMessage({ type: 'FORGET_RPIDS', rpids: rpids });
+    return;
+  } catch (e) { /* 后台可能刚好休眠，下面自己来 */ }
+
+  try {
+    const index = await getIndex();
+    let changed = false;
+    for (const rpid of rpids) {
+      if (Object.prototype.hasOwnProperty.call(index, rpid)) { delete index[rpid]; changed = true; }
+    }
+    if (changed) await setIndex(index);
+  } catch (e) { /* 索引里留个孤儿项无害，下次记录同一条时会自动修正 */ }
+}
+
 /* ------------------------------------------------------------------ 主流程 */
 
 async function start() {
@@ -431,6 +500,7 @@ async function start() {
 
   running = true;
   stopRequested = false;
+  indexRefreshDone = false;
   stats = { ok: 0, fail: 0 };
   setUi(true);
   syncCounts();
@@ -438,9 +508,8 @@ async function start() {
   $('log').textContent = '';
   setHint('正在删除…请保持此页面开着。删除期间会复用一个 bilibili 标签页发送请求。', '');
 
-  let tabId;
   try {
-    tabId = await getWorkerTab();
+    const tabId = await acquireWorkerTab();
     log('请求通道：标签页 #' + tabId);
   } catch (e) {
     log('准备 bilibili 标签页失败：' + ((e && e.message) || e));
@@ -451,6 +520,7 @@ async function start() {
   }
 
   let aborted = false;
+  const deletedRpids = [];   // 删成功的 rpid，最后交回后台清索引
 
   for (let i = 0; i < targets.length; i++) {
     const it = targets[i];
@@ -469,12 +539,12 @@ async function start() {
       stats.fail++;
       log('✗ ' + label(it) + ' → ' + t.error);
     } else {
-      r = await deleteOne(tabId, t);
+      r = await attemptDelete(t);
 
       if (r.code === -509) {
         log('  ↻ 触发风控限流（-509），等 15 秒后重试一次…');
         await sleep(15000);
-        r = await deleteOne(tabId, t);
+        r = await attemptDelete(t);
       }
 
       if (r.ok || r.code === 12022) {
@@ -483,6 +553,7 @@ async function start() {
         it.note = moveErr || (r.ok ? '已删除' : '本来就不存在（已归档）');
         stats.ok++;
         delete indexCache[t.rpid];
+        deletedRpids.push(t.rpid);
         log('✓ ' + label(it) + (r.ok ? ' 已删除' : ' 早就被删了，直接归档'));
       } else {
         it.status = 'failed';
@@ -504,7 +575,7 @@ async function start() {
     if (!stopRequested && i < targets.length - 1) await sleep(randInt(settings.minDelay, settings.maxDelay));
   }
 
-  try { await setIndex(indexCache); } catch (e) { /* 忽略 */ }
+  await forgetRpids(deletedRpids);
   await refreshBadge();
 
   if (workerCreated && workerTabId !== null) {
@@ -526,6 +597,15 @@ async function start() {
     setHint(`本次成功 ${stats.ok} 条，失败 ${stats.fail} 条。失败的书签仍然留在「${folderPath(settings, settings.folderActive)}」里，日志里有原因，修好后可点「重试失败项」。`, 'warn');
   }
   log(`—— 结束：成功 ${stats.ok}，失败 ${stats.fail}，目录剩余 ${left} ——`);
+}
+
+/** 删一条，并把「连标签页都拿不到」这种情况收敛成一条失败原因，不让它掀翻整个循环 */
+async function attemptDelete(target) {
+  try {
+    return await deleteWithRecovery(target);
+  } catch (e) {
+    return { ok: false, code: null, message: '打不开 bilibili 标签页：' + ((e && e.message) || e) };
+  }
 }
 
 init().catch(e => setHint('初始化失败：' + ((e && e.message) || e), 'bad'));

@@ -16,13 +16,13 @@ import {
 
 chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
   if (msg && msg.type === 'RECORD_COMMENT') {
-    handleRecord(msg.payload)
+    withIndexLock(function () { return handleRecord(msg.payload); })
       .then(function (r) { sendResponse(r); })
       .catch(function (e) { sendResponse({ ok: false, reason: String((e && e.message) || e) }); });
     return true; // 异步回复
   }
   if (msg && msg.type === 'COMMENT_DELETED') {
-    handleDeleted(msg.payload)
+    withIndexLock(function () { return handleDeleted(msg.payload); })
       .then(function (r) { sendResponse(r); })
       .catch(function (e) { sendResponse({ ok: false, reason: String((e && e.message) || e) }); });
     return true;
@@ -31,8 +31,53 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
     updateBadge().then(function () { sendResponse({ ok: true }); });
     return true;
   }
+  // 清除面板删完成功后，把对应的索引项交回后台来删。
+  // 面板不能自己整体写回索引：它在 init() 时读了一份快照，
+  // 删除期间后台可能又记了新评论，整体写回会把那些新的覆盖掉。
+  if (msg && msg.type === 'FORGET_RPIDS') {
+    withIndexLock(function () { return forgetRpids(msg.rpids); })
+      .then(function (r) { sendResponse(r); })
+      .catch(function (e) { sendResponse({ ok: false, reason: String((e && e.message) || e) }); });
+    return true;
+  }
   return false;
 });
+
+/**
+ * 索引锁：rpid -> 元数据的「读-改-写」必须串行。
+ *
+ * getIndex() 每次都从 storage 反序列化出一份独立副本，所以两个并发的 handler
+ * 各自加完自己的条目、再各自整份写回时，后写的会把先写的覆盖掉，那条评论的
+ * oid / type 就静默丢了 —— 之后删它就会报「缺少评论区 oid」。
+ * 一秒内连发两条评论、或者清除面板收尾时正好在另一个标签页发评论，都会撞上。
+ */
+let indexLock = Promise.resolve();
+
+function withIndexLock(task) {
+  const next = indexLock.then(task, task);
+  // 无论成功还是抛错都把锁解开，别让一次异常卡死后面所有写入
+  indexLock = next.then(function () {}, function () {});
+  return next;
+}
+
+/** 按 rpid 列表清理索引项。现读现写，不覆盖删除期间新记进来的条目。 */
+async function forgetRpids(rpids) {
+  const list = Array.isArray(rpids)
+    ? rpids.map(function (r) { return String(r); }).filter(function (r) { return /^\d+$/.test(r); })
+    : [];
+  if (!list.length) return { ok: true, removed: 0 };
+
+  const index = await getIndex();
+  let removed = 0;
+  for (const rpid of list) {
+    if (Object.prototype.hasOwnProperty.call(index, rpid)) {
+      delete index[rpid];
+      removed++;
+    }
+  }
+  if (removed) await setIndex(index);
+  return { ok: true, removed: removed };
+}
 
 /** 只接受纯数字字符串，其余一律返回 null */
 function digits(v) {

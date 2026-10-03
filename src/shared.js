@@ -18,7 +18,23 @@ export const DEFAULT_SETTINGS = {
 
 export const K_SETTINGS = 'bc_settings';
 export const K_INDEX = 'bc_index';
-export const K_INDEX_SYNC = 'bc_index_sync';
+export const K_INDEX_SYNC = 'bc_index_sync';   // v1.0.0 的单键格式，只用于兼容读取
+export const K_SYNC_META = 'bc_sync_meta';     // { chunks, bytes, at }
+export const K_SYNC_CHUNK = 'bc_sync_c';       // 分片键前缀，后面接序号
+export const K_SYNC_STATE = 'bc_sync_state';   // 上次云备份成功与否，给设置页显示
+
+/* chrome.storage.sync 的硬限制：单键 8192 字节、总量 102400 字节。
+ * v1.0.0 把整个索引塞进一个键，实测第 15 条就超限，而失败被 .catch(() => {}) 静默吞掉，
+ * 于是「换设备记录自动回来」这条卖点悄悄失效了。现在按字节数分片，并把结果落进
+ * K_SYNC_STATE，让设置页能如实告诉用户备份到底成没成。 */
+const SYNC_CHUNK_BUDGET = 7000;   // 每片留出余量，不贴着 8192 走
+const SYNC_TOTAL_LIMIT = 100000;  // 102400 是硬上限，留出键名与元信息的余量
+const SYNC_BACKOFF_MS = 60000;    // 备份失败后 1 分钟内不再重试，免得反复撞配额
+
+const textEncoder = new TextEncoder();
+function utf8Bytes(str) {
+  return textEncoder.encode(str).length;
+}
 
 /* ------------------------------------------------------------------ 设置 */
 
@@ -44,29 +60,166 @@ export async function getIndex() {
   if (local && Object.keys(local).length) return local;
 
   // 本地空了（例如扩展被重装），尝试从同步存储里恢复
-  try {
-    const s = await chrome.storage.sync.get(K_INDEX_SYNC);
-    const remote = s[K_INDEX_SYNC];
-    if (remote && Object.keys(remote).length) {
-      await chrome.storage.local.set({ [K_INDEX]: remote });
-      return remote;
-    }
-  } catch (e) { /* 同步存储不可用时忽略 */ }
+  const remote = await readSyncIndex();
+  if (remote && Object.keys(remote).length) {
+    await chrome.storage.local.set({ [K_INDEX]: remote });
+    return remote;
+  }
   return {};
 }
 
+/**
+ * 云备份只存删除时真正需要的两个字段：oid（评论区 id）和 type（评论区类型）。
+ * 标题、正文、bookmarkId、完整链接这些，要么本来就在书签里跟着浏览器一起同步，
+ * 要么可以从书签反推，塞进配额里纯属白占地方——实测每条从 578 字节压到约 55 字节，
+ * 同样的 102400 字节总量上限，能备份的条数多出十倍。
+ */
+function compactIndex(index) {
+  const out = {};
+  for (const rpid of Object.keys(index)) {
+    const meta = index[rpid];
+    if (!meta) continue;
+    const c = {};
+    if (meta.oid !== undefined && meta.oid !== null && meta.oid !== '') c.o = String(meta.oid);
+    if (meta.type !== undefined && meta.type !== null) c.t = Number(meta.type);
+    if (c.o !== undefined || c.t !== undefined) out[rpid] = c;
+  }
+  return out;
+}
+
+/** compactIndex 的逆操作；同时兼容 v1.0.0 备份里那种「存整个对象」的格式 */
+function expandIndex(stored) {
+  const out = {};
+  for (const rpid of Object.keys(stored)) {
+    const c = stored[rpid];
+    if (!c || typeof c !== 'object') continue;
+
+    const rawOid = c.o !== undefined ? c.o : c.oid;
+    const rawType = c.t !== undefined ? c.t : c.type;
+
+    out[rpid] = {
+      rpid: rpid,
+      oid: (rawOid === undefined || rawOid === null) ? '' : String(rawOid),
+      type: (rawType === undefined || rawType === null || Number.isNaN(Number(rawType)))
+        ? null : Number(rawType)
+    };
+  }
+  return out;
+}
+
+/** 把紧凑索引按 UTF-8 字节数切成若干片，保证每片都不超过 chrome 的单键上限 */
+function packChunks(compact) {
+  const chunks = [];
+  let cur = {};
+  for (const key of Object.keys(compact).sort()) {
+    const probe = Object.assign({}, cur, { [key]: compact[key] });
+    if (Object.keys(cur).length && utf8Bytes(JSON.stringify(probe)) > SYNC_CHUNK_BUDGET) {
+      chunks.push(cur);
+      cur = { [key]: compact[key] };
+    } else {
+      cur = probe;
+    }
+  }
+  if (Object.keys(cur).length) chunks.push(cur);
+  return chunks;
+}
+
+/**
+ * 读同步存储里的索引。分片格式优先；没有分片元信息时退回 v1.0.0 的单键格式。
+ * 同步存储不可用（未登录、被企业策略禁用等）时返回 null，由调用方当作「没有备份」处理。
+ */
+async function readSyncIndex() {
+  try {
+    const metaBox = await chrome.storage.sync.get(K_SYNC_META);
+    const meta = metaBox && metaBox[K_SYNC_META];
+
+    if (meta && typeof meta.chunks === 'number') {
+      if (meta.chunks <= 0) return {};        // 已经迁移过，而且确实是空的
+      const keys = [];
+      for (let i = 0; i < meta.chunks; i++) keys.push(K_SYNC_CHUNK + i);
+      const got = await chrome.storage.sync.get(keys);
+      const merged = {};
+      for (const k of keys) Object.assign(merged, got[k] || {});
+      return expandIndex(merged);
+    }
+
+    // 兼容 v1.0.0：整个索引存在一个键里
+    const legacyBox = await chrome.storage.sync.get(K_INDEX_SYNC);
+    const legacy = legacyBox && legacyBox[K_INDEX_SYNC];
+    return (legacy && Object.keys(legacy).length) ? expandIndex(legacy) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/** 写入同步存储。超过总量上限直接抛错，绝不半途静默放弃 */
+async function writeSyncIndex(index) {
+  const compact = compactIndex(index);
+  const chunks = packChunks(compact);
+  const count = Object.keys(compact).length;
+  const bytes = chunks.reduce((n, c) => n + utf8Bytes(JSON.stringify(c)), 0);
+
+  if (bytes > SYNC_TOTAL_LIMIT) {
+    throw new Error('索引 ' + count + ' 条约 ' + bytes + ' 字节，超过云同步 ' +
+      SYNC_TOTAL_LIMIT + ' 字节总量上限');
+  }
+
+  const oldBox = await chrome.storage.sync.get(K_SYNC_META).catch(() => null);
+  const hadMeta = !!(oldBox && oldBox[K_SYNC_META]);
+  const oldCount = hadMeta ? (Number(oldBox[K_SYNC_META].chunks) || 0) : 0;
+
+  const payload = { [K_SYNC_META]: { chunks: chunks.length, bytes: bytes, at: Date.now() } };
+  chunks.forEach((c, i) => { payload[K_SYNC_CHUNK + i] = c; });
+  await chrome.storage.sync.set(payload);
+
+  // 片数变少时要清掉多余的老片；首次迁移顺手删掉 v1.0.0 的旧单键
+  const stale = [];
+  for (let i = chunks.length; i < oldCount; i++) stale.push(K_SYNC_CHUNK + i);
+  if (!hadMeta) stale.push(K_INDEX_SYNC);
+  if (stale.length) await chrome.storage.sync.remove(stale).catch(() => {});
+
+  return { count: count, chunks: chunks.length, bytes: bytes };
+}
+
+/** 上一次云备份的结果，给设置页显示用 */
+export async function getSyncState() {
+  const o = await chrome.storage.local.get(K_SYNC_STATE);
+  return o[K_SYNC_STATE] || null;
+}
+
 let syncTimer = null;
+let syncBackoffUntil = 0;
+
+async function flushSyncIndex(index) {
+  try {
+    const info = await writeSyncIndex(index);
+    syncBackoffUntil = 0;
+    await chrome.storage.local.set({
+      [K_SYNC_STATE]: {
+        ok: true, count: info.count, chunks: info.chunks, bytes: info.bytes, at: Date.now()
+      }
+    });
+  } catch (e) {
+    syncBackoffUntil = Date.now() + SYNC_BACKOFF_MS;
+    await chrome.storage.local.set({
+      [K_SYNC_STATE]: {
+        ok: false, reason: String((e && e.message) || e),
+        count: Object.keys(compactIndex(index)).length, at: Date.now()
+      }
+    }).catch(() => {});
+  }
+}
 
 export async function setIndex(idx) {
   await chrome.storage.local.set({ [K_INDEX]: idx });
 
-  // 同步存储有写入频率限制，所以做 10 秒防抖，且失败就静默放弃
+  // 同步存储有写入频率限制，所以做 10 秒防抖。
+  // 失败不再无声无息：写进 K_SYNC_STATE，设置页会如实显示出来。
   if (syncTimer) clearTimeout(syncTimer);
   syncTimer = setTimeout(() => {
     syncTimer = null;
-    try {
-      chrome.storage.sync.set({ [K_INDEX_SYNC]: idx }).catch(() => {});
-    } catch (e) { /* 忽略配额错误 */ }
+    if (Date.now() < syncBackoffUntil) return;
+    flushSyncIndex(idx).catch(() => {});
   }, 10000);
 }
 
