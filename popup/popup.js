@@ -6,7 +6,7 @@
  */
 
 import {
-  getSettings, setSettings, findFolder, listComments, getAicuStore
+  getSettings, setSettings, libraryStats, fmtTime
 } from '../src/shared.js';
 
 const $ = id => document.getElementById(id);
@@ -15,35 +15,29 @@ async function render() {
   const s = await getSettings();
   $('enabled').checked = s.enabled;
 
-  const activeId = await findFolder(s.folderActive);
-  const deletedId = await findFolder(s.folderDeleted);
+  const st = await libraryStats();
 
-  const pending = activeId ? await listComments(activeId) : [];
-  const archived = deletedId ? await listComments(deletedId) : [];
-  const aicu = await getAicuStore();
-  const aicuN = Object.keys(aicu.items).length;
+  // 这一格是「我目前还存在的评论」—— 也就是库里"还在"的数量。
+  // 以前叫「待处理」，那是删除导向的叫法；定位改成管理器之后它不再合适。
+  $('count').textContent = String(st.live);
+  $('arc-count').textContent = String(st.deleted);
 
-  // 待处理 = 待删书签 + aicu 导入里还没处理的，按 rpid 去重（两边可能指着同一条评论）
-  const rpids = new Set(pending.map(b => b.parsed.rpid));
-  for (const k of Object.keys(aicu.items)) rpids.add(k);
-
-  $('count').textContent = String(rpids.size);
-  $('arc-count').textContent = String(archived.length);
-
-  $('aicu-line').textContent = aicuN
-    ? `aicu.cc 导入 ${aicuN} 条待处理${aicu.uid ? `（UID ${aicu.uid}）` : ''}`
-    : 'aicu.cc 导入：空';
+  const bits = [`库里共 ${st.total} 条`];
+  if (st.gone) bits.push(`已没了 ${st.gone}`);
+  if (st.unreachable) bits.push(`查不到 ${st.unreachable}`);
+  if (st.unknown) bits.push(`未检查 ${st.unknown}`);
+  if (st.recorded) bits.push(`自己记录 ${st.recorded}`);
+  if (st.imported) bits.push(`导入 ${st.imported}`);
+  $('aicu-line').textContent = bits.join('　·　') + (st.uid ? `（UID ${st.uid}）` : '');
 
   $('state-line').textContent = s.enabled
-    ? '自动记录已开启'
-    : '⚠️ 已关闭自动记录 —— 发评论不会再写入书签';
+    ? (st.probedAt ? `自动记录已开启　·　上次巡检 ${fmtTime(st.probedAt)}` : '自动记录已开启')
+    : '⚠️ 已关闭自动记录 —— 发评论不会再进库';
 }
 
 $('enabled').addEventListener('change', async function (e) {
   await setSettings({ enabled: e.target.checked });
-  $('state-line').textContent = e.target.checked
-    ? '自动记录已开启'
-    : '⚠️ 已关闭自动记录 —— 发评论不会再写入书签';
+  render().catch(function () {});
 });
 
 /** 优先开侧边栏；打不开（旧版 Chrome / 企业策略）就退回开一个标签页 */

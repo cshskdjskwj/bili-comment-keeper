@@ -194,8 +194,8 @@ globalThis.chrome = {
 const shared = await import('../src/shared.js');
 const {
   normalizeAicuItem, aicuPageUrl, aicuTypeName,
-  mergeAicuItems, listAicuItems, removeAicuItems, clearAicuStore, getAicuStore,
-  markAicuAlive, aicuCommentUrl, aicuSubUrl, parseCommentUrl, buildTitle
+  upsertLibItems, listLibItems, removeLibItems, clearLibrary, getLibrary,
+  setLibStates, normalizeLibItem, aicuCommentUrl, aicuSubUrl, parseCommentUrl, buildTitle
 } = shared;
 
 const item = (rpid, over) => Object.assign({
@@ -233,15 +233,15 @@ await test('aicuPageUrl / aicuTypeName 按评论区类型给出可点开的地�
 await test('mergeAicuItems 按 rpid 去重，并记住站上总条数', async () => {
   localData.clear();
 
-  const r1 = await mergeAicuItems({ uid: '777', total: 100, items: [item('1'), item('2'), item('2')] });
+  const r1 = await upsertLibItems({ uid: '777', total: 100, items: [item('1'), item('2'), item('2')] });
   assert.equal(r1.added, 2, '同一批里的重复 rpid 只收一次');
   assert.equal(r1.total, 2);
 
-  const r2 = await mergeAicuItems({ uid: '777', total: 100, items: [item('2'), item('3')] });
+  const r2 = await upsertLibItems({ uid: '777', total: 100, items: [item('2'), item('3')] });
   assert.equal(r2.added, 1, '跨批次也要去重');
   assert.equal(r2.total, 3);
 
-  const store = await getAicuStore();
+  const store = await getLibrary();
   assert.equal(store.uid, '777');
   assert.equal(store.total, 100);
   assert.equal(store.mixed, false);
@@ -249,10 +249,10 @@ await test('mergeAicuItems 按 rpid 去重，并记住站上总条数', async ()
 
 await test('换了 UID 只做标记，不拒绝（按约定只警告不拦）', async () => {
   localData.clear();
-  await mergeAicuItems({ uid: 'aaa', items: [item('1')] });
-  await mergeAicuItems({ uid: 'bbb', items: [item('2')] });
+  await upsertLibItems({ uid: 'aaa', items: [item('1')] });
+  await upsertLibItems({ uid: 'bbb', items: [item('2')] });
 
-  const store = await getAicuStore();
+  const store = await getLibrary();
   assert.equal(store.uid, 'bbb', 'uid 记最新的');
   assert.equal(store.mixed, true, '混了不同账号的数据要能提示出来');
   assert.equal(Object.keys(store.items).length, 2, '两边的条目都保留');
@@ -260,32 +260,32 @@ await test('换了 UID 只做标记，不拒绝（按约定只警告不拦）', 
 
 await test('listAicuItems 按时间倒序（新的在前）', async () => {
   localData.clear();
-  await mergeAicuItems({
+  await upsertLibItems({
     uid: 'u',
     items: [item('1', { ctime: 100 }), item('2', { ctime: 300 }), item('3', { ctime: 200 })]
   });
 
-  const list = await listAicuItems();
+  const list = await listLibItems();
   assert.deepEqual(list.map(x => x.rpid), ['2', '3', '1']);
 });
 
 await test('removeAicuItems 只摘掉指定条目，其余原样保留', async () => {
   localData.clear();
-  await mergeAicuItems({ uid: 'u', items: [item('1'), item('2'), item('3')] });
+  await upsertLibItems({ uid: 'u', items: [item('1'), item('2'), item('3')] });
 
-  const removed = await removeAicuItems(['1', '3', 'nope']);
+  const removed = await removeLibItems(['1', '3', 'nope']);
   assert.equal(removed, 2, '不存在的 rpid 不算数');
 
-  const list = await listAicuItems();
+  const list = await listLibItems();
   assert.deepEqual(list.map(x => x.rpid), ['2']);
 });
 
 await test('clearAicuStore 清空后回到干净状态', async () => {
   localData.clear();
-  await mergeAicuItems({ uid: 'u', items: [item('1')] });
-  await clearAicuStore();
+  await upsertLibItems({ uid: 'u', items: [item('1')] });
+  await clearLibrary();
 
-  const store = await getAicuStore();
+  const store = await getLibrary();
   assert.equal(Object.keys(store.items).length, 0);
   assert.equal(store.uid, '');
   assert.equal(store.mixed, false);
@@ -293,8 +293,8 @@ await test('clearAicuStore 清空后回到干净状态', async () => {
 
 await test('全是被删过的条目时不会误报成功条数（added 为 0）', async () => {
   localData.clear();
-  await mergeAicuItems({ uid: 'u', items: [item('1')] });
-  const again = await mergeAicuItems({ uid: 'u', items: [item('1')] });
+  await upsertLibItems({ uid: 'u', items: [item('1')] });
+  const again = await upsertLibItems({ uid: 'u', items: [item('1')] });
   assert.equal(again.added, 0);
   assert.equal(again.total, 1);
 });
@@ -637,45 +637,50 @@ await test('抓取期间重复发开始指令会被忽略，不会跑成两份',
   assert.ok(delta <= 4, `重复开始指令不该让翻页速度翻倍（这 600ms 内点了 ${delta} 次）`);
 });
 
-await test('存活探测：normalizeAicuItem 会保留 alive 三态', async () => {
-  assert.equal(normalizeAicuItem({ rpid: '1', type: 1, oid: '5' }).alive, undefined, '没探过就不带这个字段');
-  assert.equal(normalizeAicuItem({ rpid: '1', type: 1, oid: '5', alive: true }).alive, true);
-  assert.equal(normalizeAicuItem({ rpid: '1', type: 1, oid: '5', alive: false }).alive, false);
+await test('存活探测：状态只有认识的那几个，其余当未检查', async () => {
+  assert.equal(normalizeLibItem({ rpid: '1', type: 1, oid: '5' }).state, 'unknown', '没探过就是未检查');
+  assert.equal(normalizeLibItem({ rpid: '1', type: 1, oid: '5', state: 'live' }).state, 'live');
+  assert.equal(normalizeLibItem({ rpid: '1', type: 1, oid: '5', state: 'gone' }).state, 'gone');
+  assert.equal(normalizeLibItem({ rpid: '1', type: 1, oid: '5', state: 'unreachable' }).state, 'unreachable');
+  assert.equal(normalizeLibItem({ rpid: '1', type: 1, oid: '5', state: '瞎写' }).state, 'unknown');
 });
 
-await test('存活探测：markAicuAlive 标记结果并落盘', async () => {
+await test('存活探测：setLibStates 标记结果并落盘', async () => {
   localData.clear();
-  await mergeAicuItems({ uid: 'u', items: [item('1'), item('2'), item('3')] });
+  await upsertLibItems({ uid: 'u', items: [item('1'), item('2'), item('3')] });
 
-  const changed = await markAicuAlive({ 1: true, 2: false, 999: true });
-  assert.equal(changed, 2, '不存在的 rpid 不算数');
+  const r = await setLibStates({ 1: 'live', 2: 'gone', 999: 'live' });
+  assert.equal(r.changed, 2, '不存在的 rpid 不算数');
 
-  const store = await getAicuStore();
-  assert.equal(store.items['1'].alive, true);
-  assert.equal(store.items['2'].alive, false);
-  assert.equal(store.items['3'].alive, undefined, '没标过的保持未探测');
+  const store = await getLibrary();
+  assert.equal(store.items['1'].state, 'live');
+  assert.equal(store.items['2'].state, 'gone');
+  assert.equal(store.items['3'].state, 'unknown', '没标过的保持未探测');
 });
 
-await test('存活探测：重复标记同一结果不算改动', async () => {
+await test('存活探测：结论没变时不算"改动"，但仍然刷新检查时间', async () => {
   localData.clear();
-  await mergeAicuItems({ uid: 'u', items: [item('1')] });
-  await markAicuAlive({ 1: true });
-  assert.equal(await markAicuAlive({ 1: true }), 0);
+  await upsertLibItems({ uid: 'u', items: [item('1')] });
+  await setLibStates({ 1: 'live' });
+
+  const again = await setLibStates({ 1: 'live' });
+  assert.equal(again.changed, 0, '结论没变就不算改动');
+  assert.equal(again.touched, 1, '但检查时间要刷新 —— 否则看不出"上次巡检是什么时候"');
 });
 
-await test('存活探测：重新导入（补全正文）不会把已有的 alive 冲掉', async () => {
+await test('存活探测：重新导入补全正文时，不会把已有的结论冲掉', async () => {
   localData.clear();
   // 先只有 rpid/type/oid，没有正文和时间
-  await mergeAicuItems({ uid: 'u', items: [item('1', { message: '', ctime: 0 })] });
-  await markAicuAlive({ 1: false });
+  await upsertLibItems({ uid: 'u', items: [item('1', { message: '', ctime: 0 })] });
+  await setLibStates({ 1: 'gone' });
 
   // 再导一次，这回带上了正文和时间
-  await mergeAicuItems({ uid: 'u', items: [item('1', { message: '补上的正文', ctime: 1700000000 })] });
+  await upsertLibItems({ uid: 'u', items: [item('1', { message: '补上的正文', ctime: 1700000000 })] });
 
-  const store = await getAicuStore();
+  const store = await getLibrary();
   assert.equal(store.items['1'].message, '补上的正文', '正文应该被补上');
   assert.equal(store.items['1'].ctime, 1700000000, '时间应该被补上');
-  assert.equal(store.items['1'].alive, false, 'alive 是探测的结论，不能被重新导入冲掉');
+  assert.equal(store.items['1'].state, 'gone', '探测结论是花时间换来的，不能被重新导入冲掉');
 });
 
 await test('存进收藏夹的 URL：解析回来必须还是同一条评论（一级评论）', async () => {

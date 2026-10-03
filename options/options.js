@@ -3,44 +3,31 @@
  */
 
 import {
-  getSettings, setSettings, ensureFolder, getIndex, getSyncState,
-  folderPath, fmtTime, DEFAULT_SETTINGS
+  getSettings, setSettings, ensureFolder, libraryStats, fmtTime
 } from '../src/shared.js';
 
 const $ = id => document.getElementById(id);
 
-/** 云备份到底成没成，如实写出来——v1.0.0 是静默失败的 */
-function syncStateText(sync) {
-  if (!sync) return '云同步备份：还没有写过（改一次设置或发一条评论后就会出现）';
-  if (sync.ok) {
-    return `云同步备份：正常（${sync.count} 条 / ${sync.chunks} 片 / 约 ${sync.bytes} 字节 / ${fmtTime(sync.at)}）`;
-  }
-  return `云同步备份：失败 —— ${sync.reason}。本地记录和书签都不受影响，只是换设备时这部分元数据同步不过去（视频评论仍可靠 BV 号反查救回来）。`;
-}
-
 async function render() {
   const s = await getSettings();
   $('enabled').checked = s.enabled;
-  $('recordContent').checked = s.recordContent;
   $('clipboardFallback').checked = s.clipboardFallback;
+  $('useBookmarks').checked = s.useBookmarks;
   $('rootParent').value = String(s.rootParent) === '1' ? '1' : '2';
   $('containerFolder').value = s.containerFolder || '';
   $('folderActive').value = s.folderActive;
-  $('folderDeleted').value = s.folderDeleted;
   $('minDelay').value = s.minDelay;
   $('maxDelay').value = s.maxDelay;
   $('badgeMode').value = ['off', 'live', 'pending'].indexOf(s.badgeMode) >= 0 ? s.badgeMode : 'off';
 
   $('ver').textContent = 'v' + chrome.runtime.getManifest().version;
 
-  const idx = await getIndex();
-  const n = Object.keys(idx).length;
-  const sync = await getSyncState();
-
+  const st = await libraryStats();
   $('index-info').textContent =
-    `当前结构：${folderPath(s, s.folderActive)}　→　${folderPath(s, s.folderDeleted)}` +
-    `　｜　本地元数据索引 ${n} 条（用来定位评论属于哪个评论区；丢了也能靠 BV 号反查，只影响非视频页面）。` +
-    `　｜　${syncStateText(sync)}`;
+    `本地评论库：${st.total} 条（还在 ${st.live}　已没了 ${st.gone}　已删除 ${st.deleted}` +
+    `　查不到 ${st.unreachable}　未检查 ${st.unknown}）` +
+    (st.probedAt ? `　·　上次巡检 ${fmtTime(st.probedAt)}` : '') +
+    '　·　数据存在扩展自己的本地存储里；要备份请在控制台里「导出 JSON」。';
 }
 
 function flash(text) {
@@ -58,44 +45,38 @@ function renderSafe() {
 
 $('btn-save').addEventListener('click', async function () {
   try {
-    const folderActive = $('folderActive').value.trim() || DEFAULT_SETTINGS.folderActive;
-    const folderDeleted = $('folderDeleted').value.trim() || DEFAULT_SETTINGS.folderDeleted;
     const containerFolder = $('containerFolder').value.trim();
+    const folderActive = $('folderActive').value.trim() || 'B站我的评论';
     const rootParent = $('rootParent').value === '1' ? '1' : '2';
+    const useBookmarks = $('useBookmarks').checked;
 
-    if (folderActive === folderDeleted) {
-      flash('两个目录名不能一样 ✗');
-      return;
-    }
-    if (containerFolder && (containerFolder === folderActive || containerFolder === folderDeleted)) {
-      flash('外层文件夹名不能和里面两个目录重名 ✗');
+    if (containerFolder && containerFolder === folderActive) {
+      flash('外层文件夹名不能和里面那个目录重名 ✗');
       return;
     }
 
     let minDelay = parseInt($('minDelay').value, 10);
     let maxDelay = parseInt($('maxDelay').value, 10);
-    if (!Number.isFinite(minDelay) || minDelay < 300) minDelay = DEFAULT_SETTINGS.minDelay;
-    if (!Number.isFinite(maxDelay) || maxDelay < minDelay) maxDelay = Math.max(minDelay, DEFAULT_SETTINGS.maxDelay);
+    if (!Number.isFinite(minDelay) || minDelay < 300) minDelay = 1500;
+    if (!Number.isFinite(maxDelay) || maxDelay < minDelay) maxDelay = Math.max(minDelay, 4000);
 
     await setSettings({
       enabled: $('enabled').checked,
-      recordContent: $('recordContent').checked,
       clipboardFallback: $('clipboardFallback').checked,
+      useBookmarks: useBookmarks,
       rootParent: rootParent,
       containerFolder: containerFolder,
       folderActive: folderActive,
-      folderDeleted: folderDeleted,
       minDelay: minDelay,
       maxDelay: maxDelay,
       badgeMode: ['off', 'live', 'pending'].indexOf($('badgeMode').value) >= 0
         ? $('badgeMode').value : 'off'
     });
 
-    // 立刻把目录建好；如果旧的两个目录还在书签栏顶层，这里会把它们整个搬进新位置
-    await ensureFolder(folderActive);
-    await ensureFolder(folderDeleted);
+    // 只有打开了收藏夹镜像才需要建目录
+    if (useBookmarks) await ensureFolder(folderActive);
 
-    flash('已保存并整理好目录 ✓');
+    flash('已保存 ✓');
     renderSafe();
   } catch (e) {
     flash('保存失败：' + ((e && e.message) || e) + ' ✗');
@@ -105,9 +86,7 @@ $('btn-save').addEventListener('click', async function () {
 $('btn-reset').addEventListener('click', async function () {
   try {
     await setSettings(Object.assign({}, DEFAULT_SETTINGS));
-    await ensureFolder(DEFAULT_SETTINGS.folderActive);
-    await ensureFolder(DEFAULT_SETTINGS.folderDeleted);
-    flash('已恢复默认 ✓');
+    if (DEFAULT_SETTINGS.useBookmarks) await ensureFolder(DEFAULT_SETTINGS.folderActive);    flash('已恢复默认 ✓');
     renderSafe();
   } catch (e) {
     flash('恢复默认失败：' + ((e && e.message) || e) + ' ✗');

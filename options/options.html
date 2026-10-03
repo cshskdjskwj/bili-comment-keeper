@@ -24,22 +24,7 @@
     <div class="field">
       <label>自动记录评论</label>
       <label class="switch"><input type="checkbox" id="enabled"><span></span></label>
-      <span class="desc">关闭后发评论不会再写入书签</span>
-    </div>
-
-    <div class="field">
-      <label>放在哪里</label>
-      <select id="rootParent">
-        <option value="2">其他收藏夹</option>
-        <option value="1">书签栏</option>
-      </select>
-      <span class="desc">推荐放「其他收藏夹」，不占用书签栏位置</span>
-    </div>
-
-    <div class="field">
-      <label>标题里带评论正文</label>
-      <label class="switch"><input type="checkbox" id="recordContent"><span></span></label>
-      <span class="desc">形如「[2026-01-30 12:34] BV1xx411c7mD · 哈哈哈哈这个太好笑了」</span>
+      <span class="desc">关闭后发评论不会再进库</span>
     </div>
 
     <div class="field">
@@ -69,24 +54,35 @@
   </div>
 
   <details class="advanced">
-    <summary>高级：改书签目录名</summary>
+    <summary>高级：同时写入浏览器收藏夹（默认关）</summary>
     <div class="form">
+      <div class="field">
+        <label>同时写一份书签</label>
+        <label class="switch"><input type="checkbox" id="useBookmarks"><span></span></label>
+        <span class="desc">数据本来存在扩展本地（评论库）里，<b>不需要</b>开这个。
+          打开只是为了让你在浏览器收藏夹里也能翻到 —— 代价是书签只能存标题和 URL，
+          几千条会把书签栏塞爆</span>
+      </div>
+
+      <div class="field">
+        <label>放在哪里</label>
+        <select id="rootParent">
+          <option value="2">其他收藏夹</option>
+          <option value="1">书签栏</option>
+        </select>
+        <span class="desc">只在上面那个开关打开时才有意义</span>
+      </div>
+
       <div class="field">
         <label>外层文件夹名</label>
         <input type="text" id="containerFolder" maxlength="40">
-        <span class="desc">两个评论目录都装进它里面；留空则直接放在上面选的位置下</span>
+        <span class="desc">留空则直接放在上面选的位置下</span>
       </div>
 
       <div class="field">
-        <label>存活评论目录名</label>
+        <label>评论目录名</label>
         <input type="text" id="folderActive" maxlength="40">
-        <span class="desc">保存在外层文件夹里面</span>
-      </div>
-
-      <div class="field">
-        <label>已删除评论目录名</label>
-        <input type="text" id="folderDeleted" maxlength="40">
-        <span class="desc">删除成功后，书签会原样移动到这里</span>
+        <span class="desc">书签就放在这里</span>
       </div>
     </div>
   </details>

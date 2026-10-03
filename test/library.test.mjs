@@ -52,7 +52,7 @@ const {
   removeLibItems, listLibItems, libraryStats, queryLib,
   saveVideoTitles, missingVideoTitles, videoKey,
   exportLibraryJSON, exportLibraryHTML, exportLibraryMarkdown, importLibraryJSON,
-  normalizeLibItem, stateFromAlive, aliveFromState
+  normalizeLibItem
 } = shared;
 
 const item = (rpid, extra) => Object.assign({
@@ -62,32 +62,6 @@ const item = (rpid, extra) => Object.assign({
 
 console.log('\n评论库（数据层）回归测试\n');
 console.log('— 老数据迁移 —');
-
-await test('第一次读库时，把老的 bc_aicu 清单迁过来（alive → state）', async () => {
-  localData.clear();
-  localData.set(K_AICU, {
-    uid: '350067609',
-    total: 1188,
-    items: {
-      '1': { rpid: '1', type: 1, oid: '555', root: '0', rank: 1, message: 'a', ctime: 100, alive: true },
-      '2': { rpid: '2', type: 1, oid: '555', root: '0', rank: 1, message: 'b', ctime: 200, alive: false },
-      '3': { rpid: '3', type: 1, oid: '555', root: '0', rank: 1, message: 'c', ctime: 300 }
-    }
-  });
-
-  const lib = await getLibrary();
-  assert.equal(lib.items['1'].state, 'live', 'alive:true → live');
-  assert.equal(lib.items['2'].state, 'gone', 'alive:false → gone');
-  assert.equal(lib.items['3'].state, 'unknown', '没有 alive → unknown');
-  assert.equal(lib.uid, '350067609');
-  assert.equal(lib.total, 1188);
-
-  // 迁移会写回库，**写成功之后才删老键**
-  const raw = localData.get(K_LIBRARY);
-  assert.ok(raw && raw.items['1'], '迁移结果要落盘');
-  assert.ok(!localData.has(K_AICU),
-    '老键要删掉 —— 留着的话「清空导入」会被下一次读库的迁移悄悄撤销');
-});
 
 await test('库已经存在时不再看老键', async () => {
   localData.clear();
@@ -99,20 +73,12 @@ await test('库已经存在时不再看老键', async () => {
   assert.ok(!lib.items['1'], '不该混进老数据');
 });
 
-await test('state / alive 双向换算', async () => {
-  assert.equal(stateFromAlive(true), 'live');
-  assert.equal(stateFromAlive(false), 'gone');
-  assert.equal(stateFromAlive(undefined), 'unknown');
-  assert.equal(aliveFromState('live'), true);
-  assert.equal(aliveFromState('gone'), false);
-  assert.equal(aliveFromState('unknown'), undefined);
-  assert.equal(aliveFromState('deleted'), undefined);
-});
-
-await test('normalizeLibItem 保留兼容字段 alive，老代码不用改就能用', async () => {
-  assert.equal(normalizeLibItem(item('1', { alive: false })).alive, false);
-  assert.equal(normalizeLibItem(item('1', { state: 'live' })).alive, true);
-  assert.equal(normalizeLibItem(item('1', { state: 'deleted' })).alive, undefined);
+await test('normalizeLibItem：来源标记与状态都规整得住', async () => {
+  assert.equal(normalizeLibItem(item('1', { source: 'record' })).source, 'record');
+  assert.equal(normalizeLibItem(item('1')).source, 'aicu', '没标来源的一律算导入的');
+  assert.equal(normalizeLibItem(item('1', { state: 'live' })).state, 'live');
+  assert.equal(normalizeLibItem(item('1')).state, 'unknown', '状态不认识就当没查过');
+  assert.equal(normalizeLibItem(item('1', { state: '乱七八糟' })).state, 'unknown');
   assert.equal(normalizeLibItem({ rpid: 'x' }), null, '缺关键字段要丢掉');
 });
 
@@ -195,15 +161,6 @@ await test('setLibStates：又活了就把 goneAt 清掉', async () => {
   const lib = await getLibrary();
   assert.equal(lib.items['1'].state, 'live');
   assert.equal(lib.items['1'].goneAt, undefined, '既然还在，就不该留着"没了"的时间');
-});
-
-await test('setLibStates：也接受老的 true/false 写法', async () => {
-  localData.clear();
-  await upsertLibItems({ uid: 'u', items: [item('1'), item('2')] });
-  await setLibStates({ 1: true, 2: false });
-  const lib = await getLibrary();
-  assert.equal(lib.items['1'].state, 'live');
-  assert.equal(lib.items['2'].state, 'gone');
 });
 
 await test('markLibDeleted：我们自己删掉的那些有独立状态', async () => {
@@ -462,6 +419,40 @@ await test('检查结论的原因会存下来（光显示"查不到"没法排查
   lib = await getLibrary();
   assert.equal(lib.items['1'].state, 'live');
   assert.ok(!lib.items['1'].note, '换了结论就不该留着上一次的原因');
+});
+
+console.log('\n— 自动记录进库（之前断掉的那一环） —');
+
+await test('自己记录下来的评论会进库，并且在统计里单列', async () => {
+  localData.clear();
+
+  // 模拟 handleRecord 写库时的那份数据
+  await upsertLibItems({
+    items: [{
+      rpid: '111', type: 1, oid: '555', root: '0', rank: 1,
+      message: '刚发的评论', ctime: 1700000000, state: 'live', source: 'record'
+    }]
+  });
+
+  const lib = await getLibrary();
+  assert.equal(lib.items['111'].state, 'live', '刚发出去的肯定是活的');
+  assert.equal(lib.items['111'].source, 'record', '要能分辨"自己记录的"和"导入的"');
+  assert.ok(lib.items['111'].firstSeen, '要记住第一次见到它的时间');
+
+  await upsertLibItems({ items: [item('222')] });
+  const s = await libraryStats();
+  assert.equal(s.recorded, 1, '自己记录的 1 条');
+  assert.equal(s.imported, 1, '导入的 1 条');
+  assert.equal(s.total, 2);
+});
+
+await test('记录比导入可信：同一条被导入覆盖时来源不会被改回去', async () => {
+  localData.clear();
+  await upsertLibItems({ items: [{ rpid: '111', type: 1, oid: '555', state: 'live', source: 'record' }] });
+  await upsertLibItems({ items: [item('111')] });        // 导入里也有这条
+
+  const lib = await getLibrary();
+  assert.equal(lib.items['111'].source, 'record', '来源不该被导入冲掉');
 });
 
 /* ---------------------------------------------------------------- 汇总 */

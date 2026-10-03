@@ -1,38 +1,33 @@
 /**
  * background.js —— 扩展后台（MV3 service worker）
  *
+ * v1.7 起数据只有**一份**：chrome.storage.local 里的评论库（bc_library）。
+ * 老的「收藏夹 + 索引 + 云同步」三件套已经拆掉了 —— 收藏夹只是个可选的镜像
+ * （设置里的「同时写入浏览器收藏夹」，默认关）。
+ *
  * 职责：
- *   1) 收到网页转发来的「我刚发了一条评论」→ 写进书签栏目录；
- *   2) 维护 rpid -> {oid, type, ...} 索引，供删除时使用；
- *   3) 维护工具栏角标上的评论条数。
+ *   1) 收到网页转发来的「我刚发了一条评论」→ 写进评论库；
+ *   2) 你在 B 站网页上自己删了评论时，把库里那条标成已删除；
+ *   3) aicu.cc 页面上读到的历史评论 → 并进库里；
+ *   4) 维护工具栏角标。
  */
 
 import {
-  getSettings, getIndex, setIndex, ensureFolder, findFolder, buildTitle, parseCommentUrl,
-  isBiliUrl, listBookmarks, listComments, mergeAicuItems,
-  getAicuStore, K_SETTINGS,
-  normalizeAicuItem, aicuCommentUrl, aicuPageUrl,
-  getLibrary, libraryStats, fmtTime
+  getSettings, ensureFolder, K_SETTINGS,
+  getLibrary, upsertLibItems, markLibDeleted, libraryStats, fmtTime
 } from './shared.js';
 
 /* ------------------------------------------------------------------ 记录 */
 
 chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
   if (msg && msg.type === 'RECORD_COMMENT') {
-    withIndexLock(function () { return handleRecord(msg.payload); })
+    withLibLock(function () { return handleRecord(msg.payload); })
       .then(function (r) { sendResponse(r); })
       .catch(function (e) { sendResponse({ ok: false, reason: String((e && e.message) || e) }); });
     return true; // 异步回复
   }
-  if (msg && msg.type === 'AICU_TO_BOOKMARKS') {
-    // 要写索引，所以和记录走同一把锁
-    withIndexLock(function () { return handleAicuToBookmarks(msg.payload); })
-      .then(function (r) { sendResponse(r); })
-      .catch(function (e) { sendResponse({ ok: false, reason: String((e && e.message) || e) }); });
-    return true;
-  }
   if (msg && msg.type === 'COMMENT_DELETED') {
-    withIndexLock(function () { return handleDeleted(msg.payload); })
+    withLibLock(function () { return handleDeleted(msg.payload); })
       .then(function (r) { sendResponse(r); })
       .catch(function (e) { sendResponse({ ok: false, reason: String((e && e.message) || e) }); });
     return true;
@@ -41,11 +36,11 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
     updateBadge().then(function () { sendResponse({ ok: true }); });
     return true;
   }
-  // 清除面板删完成功后，把对应的索引项交回后台来删。
-  // 面板不能自己整体写回索引：它在 init() 时读了一份快照，
-  // 删除期间后台可能又记了新评论，整体写回会把那些新的覆盖掉。
+  // 清除面板删完成功后，把对应的条目交回后台标成"已删除"。
+  // 面板不能自己整库写回：它在启动时读了一份快照，删除期间后台可能又记了
+  // 新评论，整库写回会把那些新的覆盖掉。
   if (msg && msg.type === 'FORGET_RPIDS') {
-    withIndexLock(function () { return forgetRpids(msg.rpids); })
+    withLibLock(function () { return handleForget(msg.rpids); })
       .then(function (r) { sendResponse(r); })
       .catch(function (e) { sendResponse({ ok: false, reason: String((e && e.message) || e) }); });
     return true;
@@ -61,51 +56,44 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
 });
 
 /**
- * aicu 导入：只做去重落盘和通知，不碰索引。
- * 真正的删除仍然走清除面板里那套（注入 B 站页面调 /x/v2/reply/del）。
- */
-async function handleAicuImport(payload) {
-  const r = await mergeAicuItems(payload);
-  if (r.added || r.enriched) {
-    broadcast({ type: 'AICU_UPDATED', added: r.added, enriched: r.enriched, total: r.total });
-  }
-  return { ok: true, added: r.added, enriched: r.enriched, total: r.total, capped: r.capped };
-}
-
-/**
- * 索引锁：rpid -> 元数据的「读-改-写」必须串行。
+ * 库的写锁：「读-改-写」必须串行。
  *
- * getIndex() 每次都从 storage 反序列化出一份独立副本，所以两个并发的 handler
- * 各自加完自己的条目、再各自整份写回时，后写的会把先写的覆盖掉，那条评论的
- * oid / type 就静默丢了 —— 之后删它就会报「缺少评论区 oid」。
- * 一秒内连发两条评论、或者清除面板收尾时正好在另一个标签页发评论，都会撞上。
+ * getLibrary() 每次都从 storage 反序列化出一份独立副本，所以两个并发的 handler
+ * 各自加完自己的条目、再各自整份写回时，后写的会把先写的覆盖掉，那条评论就静默丢了。
+ * 一秒内连发两条评论、或者面板收尾时正好在另一个标签页发评论，都会撞上。
  */
-let indexLock = Promise.resolve();
+let libLock = Promise.resolve();
 
-function withIndexLock(task) {
-  const next = indexLock.then(task, task);
+function withLibLock(task) {
+  const next = libLock.then(task, task);
   // 无论成功还是抛错都把锁解开，别让一次异常卡死后面所有写入
-  indexLock = next.then(function () {}, function () {});
+  libLock = next.then(function () {}, function () {});
   return next;
 }
 
-/** 按 rpid 列表清理索引项。现读现写，不覆盖删除期间新记进来的条目。 */
-async function forgetRpids(rpids) {
+/** 把一批 rpid 标成「我们自己删掉的」 */
+async function handleForget(rpids) {
   const list = Array.isArray(rpids)
     ? rpids.map(function (r) { return String(r); }).filter(function (r) { return /^\d+$/.test(r); })
     : [];
   if (!list.length) return { ok: true, removed: 0 };
 
-  const index = await getIndex();
-  let removed = 0;
-  for (const rpid of list) {
-    if (Object.prototype.hasOwnProperty.call(index, rpid)) {
-      delete index[rpid];
-      removed++;
-    }
+  const n = await markLibDeleted(list);
+  await updateBadge();
+  return { ok: true, removed: n };
+}
+
+/**
+ * aicu 导入：并进库，不碰别的。
+ * 真正的删除仍然走控制台里那套（注入 B 站页面调 /x/v2/reply/del）。
+ */
+async function handleAicuImport(payload) {
+  const r = await upsertLibItems(payload);
+  if (r.added || r.enriched) {
+    broadcast({ type: 'AICU_UPDATED', added: r.added, enriched: r.enriched, total: r.total });
   }
-  if (removed) await setIndex(index);
-  return { ok: true, removed: removed };
+  await updateBadge();
+  return { ok: true, added: r.added, enriched: r.enriched, total: r.total, capped: false };
 }
 
 /** 只接受纯数字字符串，其余一律返回 null */
@@ -114,35 +102,38 @@ function digits(v) {
   return /^\d+$/.test(String(v)) ? String(v) : null;
 }
 
-/** 校验并规整网页传来的数据，防止页面脚本伪造垃圾书签 */
+/** 校验并规整网页传来的数据，防止页面脚本伪造垃圾 */
 function normalize(payload) {
   if (!payload || typeof payload !== 'object') return null;
 
-  const url = String(payload.url || '');
-  if (url.length > 2000 || !isBiliUrl(url)) return null;
-
-  const parsed = parseCommentUrl(url);
-  if (!parsed || !/^\d+$/.test(String(parsed.rpid))) return null;
+  const rpid = digits(payload.rpid);
+  if (!rpid) return null;
 
   const type = digits(payload.type);
   const oid = digits(payload.oid);
 
   return {
-    url: parsed.url,
-    rpid: parsed.rpid,
-    root: parsed.rootId,
-    secondaryId: parsed.secondaryId,
-    isSecondary: parsed.isSecondary,
-    bvid: parsed.bvid,
-    pageUrl: String(payload.pageUrl || parsed.pageUrl || '').slice(0, 500),
+    rpid: rpid,
+    root: digits(payload.root) || '0',
+    parent: digits(payload.parent) || '0',
     type: type === null ? null : Number(type),
     oid: oid,
+    url: String(payload.url || '').slice(0, 2000),
     message: String(payload.message || '').slice(0, 300),
     ctime: Number(payload.ctime) || Math.floor(Date.now() / 1000),
+    isSecondary: !!payload.isSecondary,
     source: String(payload.source || 'network').slice(0, 20)
   };
 }
 
+/**
+ * 记下一条「你刚发出去的评论」。
+ *
+ * **数据以本地库为准**：直接写进评论库，source='record'、state='live'，
+ * 首页的「所有历史评论」立刻就能看到它。
+ *
+ * 收藏夹只剩一个可选动作（设置里的「同时写入浏览器收藏夹」，默认关）。
+ */
 async function handleRecord(payload) {
   const settings = await getSettings();
   if (!settings.enabled) return { ok: false, reason: '自动记录已关闭' };
@@ -156,124 +147,51 @@ async function handleRecord(payload) {
     return { ok: false, reason: '剪贴板兜底记录未开启' };
   }
 
-  const folderId = await ensureFolder(settings.folderActive);
-  const index = await getIndex();
-
-  // 已有记录：确认书签还在，在的话直接跳过
-  const prev = index[info.rpid];
-  if (prev) {
-    if (prev.bookmarkId) {
-      const alive = await chrome.bookmarks.get(prev.bookmarkId).catch(function () { return null; });
-      if (alive && alive.length) return { ok: true, duplicated: true, title: prev.title };
-    }
-    // 书签被手动删掉了，补一条
+  if (!info.oid || info.type === null) {
+    // 没有 oid / type 就没法删它，但仍然值得存下来（至少能看、能导出）
+    broadcast({ type: 'RECORD_INCOMPLETE', rpid: info.rpid });
   }
 
-  const same = await chrome.bookmarks.search({ url: info.url }).catch(function () { return []; });
-  if (same.length) {
-    index[info.rpid] = Object.assign({}, info, {
-      title: same[0].title,
-      bookmarkId: same[0].id,
-      addedAt: Date.now()
-    });
-    await setIndex(index);
-    await updateBadge();
-    return { ok: true, duplicated: true, title: same[0].title };
-  }
+  const before = await getLibrary();
+  const existed = !!before.items[info.rpid];
 
-  const title = settings.recordContent
-    ? buildTitle(info)
-    : buildTitle(Object.assign({}, info, { message: '' }));
-
-  const node = await chrome.bookmarks.create({
-    parentId: folderId,
-    title: title,
-    url: info.url
+  await upsertLibItems({
+    items: [{
+      rpid: info.rpid,
+      type: info.type,
+      oid: info.oid,
+      root: info.root,
+      rank: info.isSecondary ? 2 : 1,
+      message: info.message,
+      ctime: info.ctime,
+      state: 'live',        // 刚发出去的，肯定是活的
+      source: 'record'
+    }]
   });
 
-  index[info.rpid] = Object.assign({}, info, {
-    title: title,
-    bookmarkId: node.id,
-    addedAt: Date.now()
-  });
-  await setIndex(index);
-  await updateBadge();
-
-  return { ok: true, title: title, url: info.url };
-}
-
-/* -------------------------------------------------- 把 aicu 的存活条目存进收藏夹
- * aicu 导进来的是「历史评论」，它们本来就不在收藏夹里。探测出还活着的那批，
- * 用和扩展自己记录时**完全一样的格式**存进收藏夹 —— 之后角标、归档、删除
- * 全都按同一套逻辑走，不用为它们开小灶。
- */
-async function handleAicuToBookmarks(payload) {
-  const settings = await getSettings();
-  if (!settings.enabled) return { ok: false, reason: '扩展已停用，先在设置里打开' };
-
-  const list = (payload && payload.items) || [];
-  let created = 0, existed = 0, failed = 0;
-  const saved = [];
-
-  for (const raw of list) {
-    const item = normalizeAicuItem(raw);
-    if (!item) { failed++; continue; }
-
-    const url = aicuCommentUrl(item);
-    if (!url) { failed++; continue; }
-
-    const r = await handleRecord({
-      url: url,
-      type: item.type,
-      oid: item.oid,
-      pageUrl: aicuPageUrl(item.type, item.oid),
-      message: item.message,
-      ctime: item.ctime,
-      source: 'aicu'
-    });
-
-    if (r && r.ok) {
-      if (r.duplicated) existed++; else created++;
-      saved.push(item.rpid);
-    } else {
-      failed++;
-    }
+  let bookmarkId = null;
+  if (settings.useBookmarks && info.url) {
+    bookmarkId = await mirrorToBookmarks(settings, info);
   }
 
   await updateBadge();
-  return { ok: true, created: created, existed: existed, failed: failed, saved: saved };
+  return { ok: true, duplicated: existed, url: info.url, bookmarkId: bookmarkId };
 }
 
-/* -------------------------------------------------- 手动删除的同步归档
- * 你在 B 站网页上自己点了某条评论的「删除」时，网页会请求 /x/v2/reply/del，
- * 我们把这条消息接住，把对应的书签从「我的评论」挪到「已删除」，
- * 这样不管从哪儿删的，账都是平的。
- */
+/** 可选的收藏夹镜像；失败不影响记录本身 */
+async function mirrorToBookmarks(settings, info) {
+  try {
+    const parentId = await ensureFolder(settings.folderActive);
+    const same = await chrome.bookmarks.search({ url: info.url }).catch(function () { return []; });
+    if (same.length) return same[0].id;
 
-async function findByRpid(rpid, folderIds) {
-  for (const fid of folderIds) {
-    if (!fid) continue;
-    const list = await listBookmarks(fid);
-    for (const b of list) {
-      const parsed = parseCommentUrl(b.url);
-      if (parsed && parsed.rpid === rpid) return b;
-    }
+    const title = `[${fmtTime(info.ctime * 1000)}] ` +
+      (info.message ? String(info.message).replace(/\s+/g, ' ').slice(0, 20) : '评论');
+    const node = await chrome.bookmarks.create({ parentId: parentId, title: title, url: info.url });
+    return node.id;
+  } catch (e) {
+    return null;
   }
-  return null;
-}
-
-/** nodeId 是否位于 ancestorId 目录（含更深层子目录）之下 */
-async function isDescendantOf(nodeId, ancestorId) {
-  let cur = nodeId;
-  for (let i = 0; i < 10 && cur; i++) {
-    const arr = await chrome.bookmarks.get(cur).catch(function () { return null; });
-    if (!arr || !arr.length) return false;
-    const parentId = arr[0].parentId;
-    if (!parentId) return false;
-    if (parentId === ancestorId) return true;
-    cur = parentId;
-  }
-  return false;
 }
 
 function broadcast(msg) {
@@ -283,52 +201,27 @@ function broadcast(msg) {
   } catch (e) { /* 没有页面在监听时会抛错，忽略 */ }
 }
 
+/* -------------------------------------------------- 手动删除的同步归档
+ * 你在 B 站网页上自己点了某条评论的「删除」时，网页会请求 /x/v2/reply/del，
+ * 我们把这条消息接住，把库里那条标成「已删除」。
+ * 这样不管从哪儿删的，账都是平的。
+ */
+
 async function handleDeleted(payload) {
   const rpid = String((payload && payload.rpid) || '');
   if (!/^\d+$/.test(rpid)) return { ok: false, reason: 'rpid 无效' };
 
-  const settings = await getSettings();
-  const index = await getIndex();
-  const deletedFolderId = await ensureFolder(settings.folderDeleted);
-  const activeFolderId = await findFolder(settings.folderActive);
+  const lib = await getLibrary();
+  const it = lib.items[rpid];
 
-  // 1) 先按索引找书签
-  let node = null;
-  const meta = index[rpid];
-  if (meta && meta.bookmarkId) {
-    const arr = await chrome.bookmarks.get(meta.bookmarkId).catch(function () { return null; });
-    if (arr && arr.length) node = arr[0];
-  }
+  if (it && it.state === 'deleted') return { ok: true, already: true };
 
-  // 2) 索引里没有（比如扩展重装过），就按 rpid 在书签里翻
-  if (!node) {
-    node = await findByRpid(rpid, [activeFolderId, deletedFolderId]);
-  }
-
-  if (!node) return { ok: false, reason: '没有这条评论对应的书签' };
-
-  // 已经在「已删除」里了，把索引清掉就算完
-  if (node.parentId === deletedFolderId) {
-    if (meta) {
-      delete index[rpid];
-      await setIndex(index);
-    }
-    return { ok: true, already: true };
-  }
-
-  // 只动「我的评论」目录（含其子目录）里的书签，绝不碰你自己整理到别处的收藏
-  const inActive = activeFolderId ? await isDescendantOf(node.id, activeFolderId) : false;
-  if (!inActive) return { ok: false, reason: '书签不在记录目录里，已跳过' };
-
-  await chrome.bookmarks.move(node.id, { parentId: deletedFolderId });
-  if (meta) {
-    delete index[rpid];
-    await setIndex(index);
-  }
+  const n = await markLibDeleted([rpid]);
   await updateBadge();
   broadcast({ type: 'SYNC_ARCHIVED', rpid: rpid });
 
-  return { ok: true, title: node.title };
+  if (!n) return { ok: true, already: true, note: '库里本来就没有这条' };
+  return { ok: true };
 }
 
 /* ------------------------------------------------------------------ 角标 */
@@ -338,20 +231,19 @@ async function handleDeleted(payload) {
  *
  *   off     不显示（**默认**）
  *   live    显示库里"还在"的条数
- *   pending 显示待处理总数（旧行为 = 待删书签 + 库里还没处理的，按 rpid 去重）
+ *   pending 显示还没处理的条数（库里除"已删除"之外的全部）
  *
- * 为什么默认改成不显示：产品定位从"把评论删干净"变成"本地评论管理器 + 备份"之后，
- * 角标就不再是任务提醒了 —— 一个档案柜不需要在图标上顶一个数字催你。
- * 想留着的在设置里打开即可。
+ * 为什么默认不显示：产品定位是"本地评论管理器 + 备份"，角标不再是任务提醒 ——
+ * 一个档案柜不需要在图标上顶一个数字催你。想留着的在设置里打开即可。
  */
 async function updateBadge() {
   try {
     const settings = await getSettings();
     const mode = String(settings.badgeMode || 'off');
+    const s = await libraryStats();
 
     if (mode === 'off') {
       await chrome.action.setBadgeText({ text: '' });
-      const s = await libraryStats();
       await chrome.action.setTitle({
         title: `B站评论管家 · 库里 ${s.total} 条` +
           (s.live ? `，还在 ${s.live} 条` : '') +
@@ -362,38 +254,25 @@ async function updateBadge() {
 
     let count = 0;
     let tip = '';
-
     if (mode === 'live') {
-      const s = await libraryStats();
       count = s.live;
       tip = `还在 ${s.live} 条（库里共 ${s.total} 条）`;
     } else {
-      const rpids = new Set();
-      const activeId = await findFolder(settings.folderActive);
-      if (activeId) {
-        for (const b of await listComments(activeId)) rpids.add(b.parsed.rpid);
-      }
-      const lib = await getLibrary();
-      for (const rpid of Object.keys(lib.items)) {
-        if (lib.items[rpid].state !== 'deleted') rpids.add(rpid);
-      }
-      count = rpids.size;
-      tip = `待处理 ${count} 条`;
+      count = s.total - s.deleted;
+      tip = `还没处理 ${count} 条（库里共 ${s.total} 条）`;
     }
 
     await chrome.action.setBadgeBackgroundColor({ color: '#fb7299' });
     await chrome.action.setBadgeText({
       text: count > 0 ? (count > 999 ? '999+' : String(count)) : ''
     });
-    await chrome.action.setTitle({
-      title: `B站评论管家 · ${tip}`
-    });
+    await chrome.action.setTitle({ title: `B站评论管家 · ${tip}` });
   } catch (e) {
     // 角标失败不影响主流程
   }
 }
 
-/** 书签被创建/删除/移动/改名时（含你手动整理），稍后重算一次角标 */
+/** 书签被创建/删除/移动/改名时（打开收藏夹镜像时才有意义），稍后重算一次角标 */
 let badgeTimer = null;
 function scheduleBadgeUpdate() {
   if (badgeTimer) clearTimeout(badgeTimer);
@@ -413,8 +292,7 @@ chrome.bookmarks.onChanged.addListener(scheduleBadgeUpdate);
 chrome.runtime.onInstalled.addListener(async function () {
   const settings = await getSettings();
   await chrome.storage.local.set({ [K_SETTINGS]: Object.assign({}, settings) });
-  await ensureFolder(settings.folderActive);
-  await ensureFolder(settings.folderDeleted);
+  if (settings.useBookmarks) await ensureFolder(settings.folderActive);
   await updateBadge();
 });
 

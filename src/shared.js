@@ -2,43 +2,30 @@
  * shared.js —— 公共工具
  * 被 background（service worker）与 popup / clean / options 三个页面共用。
  * 注意：这里不能引用任何 DOM，因为 service worker 里没有 document。
+ *
+ * v1.7 起数据只有**一份**：chrome.storage.local 里的评论库（bc_library）。
+ * 老的「收藏夹 + 索引 + 云同步」那一整套已经拆掉了 —— 收藏夹只能存标题和 URL，
+ * 几千条会把书签栏塞爆；备份改用导出 JSON。
  */
 
 export const DEFAULT_SETTINGS = {
   enabled: true,                    // 是否开启自动记录
-  rootParent: '2',                  // 放在哪：'1' = 书签栏，'2' = 其他收藏夹
-  containerFolder: '评论管家',       // 上层容器目录名；留空则两个目录直接放在 rootParent 下
-  folderActive: 'B站我的评论',       // 存活的评论链接目录
-  folderDeleted: 'B站已删除评论',    // 已删除的评论链接目录
   minDelay: 1500,                   // 删除间隔下限（毫秒）
   maxDelay: 4000,                   // 删除间隔上限（毫秒）
-  recordContent: true,              // 是否把评论正文摘录进书签标题
   clipboardFallback: false,         // 手动「复制评论链接」时也记录（可能误记别人的评论，默认关）
   // 角标显示什么：off=不显示（默认，定位是管理器不是任务列表）/ live=库里的存活条数 / pending=待处理总数
-  badgeMode: 'off'
+  badgeMode: 'off',
+  // 还要不要往浏览器收藏夹里写书签。默认关：数据以本地库为准。
+  // 留这个开关只是给"想在浏览器书签里也能翻到"的人用。
+  useBookmarks: false,
+  // 收藏夹相关（只在 useBookmarks 打开时才有意义）
+  rootParent: '2',                  // 放在哪：'1' = 书签栏，'2' = 其他收藏夹
+  containerFolder: '评论管家',       // 上层容器目录名
+  folderActive: 'B站我的评论'        // 评论链接目录
 };
 
 export const K_SETTINGS = 'bc_settings';
-export const K_INDEX = 'bc_index';
-export const K_INDEX_SYNC = 'bc_index_sync';   // v1.0.0 的单键格式，只用于兼容读取
-export const K_SYNC_META = 'bc_sync_meta';     // { chunks, bytes, at }
-export const K_SYNC_CHUNK = 'bc_sync_c';       // 分片键前缀，后面接序号
-export const K_SYNC_STATE = 'bc_sync_state';   // 上次云备份成功与否，给设置页显示
-export const K_AICU = 'bc_aicu';               // 从 aicu.cc 导入的历史评论清单
 
-/* chrome.storage.sync 的硬限制：单键 8192 字节、总量 102400 字节。
- * v1.0.0 把整个索引塞进一个键，实测第 15 条就超限，而失败被 .catch(() => {}) 静默吞掉，
- * 于是「换设备记录自动回来」这条卖点悄悄失效了。现在按字节数分片，并把结果落进
- * K_SYNC_STATE，让设置页能如实告诉用户备份到底成没成。 */
-const SYNC_CHUNK_BUDGET = 7000;   // 每片留出余量，不贴着 8192 走
-const SYNC_HARD_LIMIT = 102400;   // chrome.storage.sync 的 QUOTA_BYTES 硬上限
-const SYNC_TOTAL_LIMIT = 100000;  // 预检阈值：给分片键名、meta 和其它键留出余量
-const SYNC_BACKOFF_MS = 60000;    // 备份失败后 1 分钟内不再重试，免得反复撞配额
-
-const textEncoder = new TextEncoder();
-function utf8Bytes(str) {
-  return textEncoder.encode(str).length;
-}
 
 /* ------------------------------------------------------------------ 设置 */
 
@@ -51,320 +38,6 @@ export async function setSettings(patch) {
   const next = Object.assign(await getSettings(), patch);
   await chrome.storage.local.set({ [K_SETTINGS]: next });
   return next;
-}
-
-/* ------------------------------------------------- 评论索引（rpid -> 元数据）
- * 书签本身只存「标题 + 链接」，删除时需要 oid(视频aid) 与 type(评论区类型)。
- * 索引就是用来补这两个字段的；万一索引丢了，视频类评论还能用 BV 号反查 aid。
- */
-
-export async function getIndex() {
-  const o = await chrome.storage.local.get(K_INDEX);
-  const local = o[K_INDEX];
-  if (local && Object.keys(local).length) return local;
-
-  // 本地空了（例如扩展被重装），尝试从同步存储里恢复
-  const remote = await readSyncIndex();
-  if (remote && Object.keys(remote).length) {
-    await chrome.storage.local.set({ [K_INDEX]: remote });
-    return remote;
-  }
-  return {};
-}
-
-/**
- * 云备份只存删除时真正需要的两个字段：oid（评论区 id）和 type（评论区类型）。
- * 标题、正文、bookmarkId、完整链接这些，要么本来就在书签里跟着浏览器一起同步，
- * 要么可以从书签反推，塞进配额里纯属白占地方——实测每条从 578 字节压到约 55 字节，
- * 同样的 102400 字节总量上限，能备份的条数多出十倍。
- */
-function compactIndex(index) {
-  const out = {};
-  for (const rpid of Object.keys(index)) {
-    const meta = index[rpid];
-    if (!meta) continue;
-    const c = {};
-    if (meta.oid !== undefined && meta.oid !== null && meta.oid !== '') c.o = String(meta.oid);
-    if (meta.type !== undefined && meta.type !== null) c.t = Number(meta.type);
-    if (c.o !== undefined || c.t !== undefined) out[rpid] = c;
-  }
-  return out;
-}
-
-/** compactIndex 的逆操作；同时兼容 v1.0.0 备份里那种「存整个对象」的格式 */
-function expandIndex(stored) {
-  const out = {};
-  for (const rpid of Object.keys(stored)) {
-    const c = stored[rpid];
-    if (!c || typeof c !== 'object') continue;
-
-    const rawOid = c.o !== undefined ? c.o : c.oid;
-    const rawType = c.t !== undefined ? c.t : c.type;
-
-    out[rpid] = {
-      rpid: rpid,
-      oid: (rawOid === undefined || rawOid === null) ? '' : String(rawOid),
-      type: (rawType === undefined || rawType === null || Number.isNaN(Number(rawType)))
-        ? null : Number(rawType)
-    };
-  }
-  return out;
-}
-
-/** 把紧凑索引按 UTF-8 字节数切成若干片，保证每片都不超过 chrome 的单键上限 */
-function packChunks(compact) {
-  const chunks = [];
-  let cur = {};
-  for (const key of Object.keys(compact).sort()) {
-    const probe = Object.assign({}, cur, { [key]: compact[key] });
-    if (Object.keys(cur).length && utf8Bytes(JSON.stringify(probe)) > SYNC_CHUNK_BUDGET) {
-      chunks.push(cur);
-      cur = { [key]: compact[key] };
-    } else {
-      cur = probe;
-    }
-  }
-  if (Object.keys(cur).length) chunks.push(cur);
-  return chunks;
-}
-
-/**
- * 读同步存储里的索引。分片格式优先；没有分片元信息时退回 v1.0.0 的单键格式。
- * 同步存储不可用（未登录、被企业策略禁用等）时返回 null，由调用方当作「没有备份」处理。
- */
-async function readSyncIndex() {
-  try {
-    const metaBox = await chrome.storage.sync.get(K_SYNC_META);
-    const meta = metaBox && metaBox[K_SYNC_META];
-
-    if (meta && typeof meta.chunks === 'number') {
-      if (meta.chunks <= 0) return {};        // 已经迁移过，而且确实是空的
-      const keys = [];
-      for (let i = 0; i < meta.chunks; i++) keys.push(K_SYNC_CHUNK + i);
-      const got = await chrome.storage.sync.get(keys);
-      const merged = {};
-      for (const k of keys) Object.assign(merged, got[k] || {});
-      return expandIndex(merged);
-    }
-
-    // 兼容 v1.0.0：整个索引存在一个键里
-    const legacyBox = await chrome.storage.sync.get(K_INDEX_SYNC);
-    const legacy = legacyBox && legacyBox[K_INDEX_SYNC];
-    return (legacy && Object.keys(legacy).length) ? expandIndex(legacy) : null;
-  } catch (e) {
-    return null;
-  }
-}
-
-/** 写入同步存储。超过总量上限直接抛错，绝不半途静默放弃 */
-async function writeSyncIndex(index) {
-  const compact = compactIndex(index);
-  const chunks = packChunks(compact);
-  const count = Object.keys(compact).length;
-  const bytes = chunks.reduce((n, c) => n + utf8Bytes(JSON.stringify(c)), 0);
-
-  if (bytes > SYNC_TOTAL_LIMIT) {
-    // 说清楚哪个数字是 Chrome 的硬上限、哪个是本扩展自己留的余量，
-    // 免得用户把这个数字当成平台配额。
-    throw new Error('索引 ' + count + ' 条约 ' + bytes + ' 字节，超过云同步容量' +
-      '（Chrome 上限 ' + SYNC_HARD_LIMIT + ' 字节，扣掉分片键名等开销后按 ' +
-      SYNC_TOTAL_LIMIT + ' 字节预检）');
-  }
-
-  const oldBox = await chrome.storage.sync.get(K_SYNC_META).catch(() => null);
-  const hadMeta = !!(oldBox && oldBox[K_SYNC_META]);
-  const oldCount = hadMeta ? (Number(oldBox[K_SYNC_META].chunks) || 0) : 0;
-
-  const payload = { [K_SYNC_META]: { chunks: chunks.length, bytes: bytes, at: Date.now() } };
-  chunks.forEach((c, i) => { payload[K_SYNC_CHUNK + i] = c; });
-  await chrome.storage.sync.set(payload);
-
-  // 片数变少时要清掉多余的老片；首次迁移顺手删掉 v1.0.0 的旧单键
-  const stale = [];
-  for (let i = chunks.length; i < oldCount; i++) stale.push(K_SYNC_CHUNK + i);
-  if (!hadMeta) stale.push(K_INDEX_SYNC);
-  if (stale.length) await chrome.storage.sync.remove(stale).catch(() => {});
-
-  return { count: count, chunks: chunks.length, bytes: bytes };
-}
-
-/** 上一次云备份的结果，给设置页显示用 */
-export async function getSyncState() {
-  const o = await chrome.storage.local.get(K_SYNC_STATE);
-  return o[K_SYNC_STATE] || null;
-}
-
-let syncTimer = null;
-let syncBackoffUntil = 0;
-
-async function flushSyncIndex(index) {
-  try {
-    const info = await writeSyncIndex(index);
-    syncBackoffUntil = 0;
-    await chrome.storage.local.set({
-      [K_SYNC_STATE]: {
-        ok: true, count: info.count, chunks: info.chunks, bytes: info.bytes, at: Date.now()
-      }
-    });
-  } catch (e) {
-    syncBackoffUntil = Date.now() + SYNC_BACKOFF_MS;
-    await chrome.storage.local.set({
-      [K_SYNC_STATE]: {
-        ok: false, reason: String((e && e.message) || e),
-        count: Object.keys(compactIndex(index)).length, at: Date.now()
-      }
-    }).catch(() => {});
-  }
-}
-
-export async function setIndex(idx) {
-  await chrome.storage.local.set({ [K_INDEX]: idx });
-
-  // 同步存储有写入频率限制，所以做 10 秒防抖。
-  // 失败不再无声无息：写进 K_SYNC_STATE，设置页会如实显示出来。
-  if (syncTimer) clearTimeout(syncTimer);
-  syncTimer = setTimeout(() => {
-    syncTimer = null;
-    if (Date.now() < syncBackoffUntil) return;
-    flushSyncIndex(idx).catch(() => {});
-  }, 10000);
-}
-
-/* ------------------------------------------------------------------ 书签 */
-
-async function safeChildren(id) {
-  try {
-    return await chrome.bookmarks.getChildren(id);
-  } catch (e) {
-    return [];
-  }
-}
-
-/** rootParent 常量 -> 真实节点 id */
-function parentNodeId(settings) {
-  return String(settings.rootParent || '2') === '1' ? '1' : '2';
-}
-
-/**
- * 求「容器目录」的 id（也就是两个评论目录的父目录）。
- * create=false 时找不到就返回 null。
- */
-async function resolveContainerId(settings, create) {
-  const parentId = parentNodeId(settings);
-  const name = String(settings.containerFolder || '').trim();
-  if (!name) return parentId;
-
-  const children = await safeChildren(parentId);
-  const hit = children.find(n => !n.url && n.title === name);
-  if (hit) return hit.id;
-  if (!create) return null;
-
-  try {
-    const node = await chrome.bookmarks.create({ parentId, title: name });
-    return node.id;
-  } catch (e) {
-    return parentId;
-  }
-}
-
-/**
- * 把旧版本建在「书签栏 / 其他收藏夹」顶层的同名目录，整个搬进容器。
- * 移动目录会连带里面的所有书签、并且保留它们的节点 id，所以索引不会失效。
- */
-async function adoptLegacyFolder(title, containerId) {
-  for (const pid of ['1', '2']) {
-    if (pid === containerId) continue;
-    const children = await safeChildren(pid);
-    const hit = children.find(n => !n.url && n.title === title);
-    if (hit) {
-      try {
-        await chrome.bookmarks.move(hit.id, { parentId: containerId });
-      } catch (e) { /* 搬不动就算了，后面会在容器里新建一个 */ }
-      return hit;
-    }
-  }
-  return null;
-}
-
-/** 查找目录（不会创建）；找不到返回 null */
-export async function findFolder(title) {
-  const settings = await getSettings();
-
-  const containerId = await resolveContainerId(settings, false);
-  if (containerId) {
-    const children = await safeChildren(containerId);
-    const hit = children.find(n => !n.url && n.title === title);
-    if (hit) return hit.id;
-  }
-
-  // 兜底：用户可能自己把它挪到别处了
-  const found = await chrome.bookmarks.search({ title });
-  const hit = found.find(n => !n.url && n.title === title);
-  return hit ? hit.id : null;
-}
-
-/**
- * 查找目录，找不到就按设置创建 —— 需要的话连容器目录一起建，
- * 并把旧位置上的同名目录整体搬过来。
- */
-export async function ensureFolder(title) {
-  const settings = await getSettings();
-  const containerId = await resolveContainerId(settings, true);
-
-  let children = await safeChildren(containerId);
-  let hit = children.find(n => !n.url && n.title === title);
-
-  if (!hit) {
-    // 老版本（或用户手动）把它建在了顶层，搬进容器里
-    hit = await adoptLegacyFolder(title, containerId);
-  }
-  if (hit) return hit.id;
-
-  try {
-    const node = await chrome.bookmarks.create({ parentId: containerId, title });
-    return node.id;
-  } catch (e) {
-    const node = await chrome.bookmarks.create({ parentId: parentNodeId(settings), title });
-    return node.id;
-  }
-}
-
-/** 拼一个给人看的路径，例如：其他收藏夹 / 评论管家 / B站我的评论 */
-export function folderPath(settings, folderName) {
-  const parent = parentNodeId(settings) === '1' ? '书签栏' : '其他收藏夹';
-  const container = String(settings.containerFolder || '').trim();
-  return [parent, container, folderName].filter(Boolean).join(' / ');
-}
-
-/** 递归列出一个目录下的全部书签（最多下钻 3 层） */
-export async function listBookmarks(folderId) {
-  const out = [];
-  async function walk(id, depth) {
-    let children = [];
-    try {
-      children = await chrome.bookmarks.getChildren(id);
-    } catch (e) {
-      return;
-    }
-    for (const c of children) {
-      if (c.url) out.push(c);
-      else if (depth < 3) await walk(c.id, depth + 1);
-    }
-  }
-  await walk(folderId, 0);
-  return out;
-}
-
-/** 只挑出「评论链接」书签，并按标题倒序（新的在前） */
-export async function listComments(folderId) {
-  const all = await listBookmarks(folderId);
-  const out = [];
-  for (const b of all) {
-    const parsed = parseCommentUrl(b.url);
-    if (parsed) out.push(Object.assign({}, b, { parsed: parsed }));
-  }
-  out.sort((a, b) => String(b.title || '').localeCompare(String(a.title || '')));
-  return out;
 }
 
 /* ------------------------------------------- aicu.cc 导入的历史评论清单
@@ -472,47 +145,28 @@ export function normalizeAicuItem(raw) {
   return out;
 }
 
-/* 老接口：全部转发到「库」上
+/**
+ * 确保「容器目录 / 目录名」存在，返回它的 id。
  *
- * v1.5 把权威数据源换成了库（见下一节）。这些是 v1.4 及以前的入口，保留下来
- * 是为了让调用方不用一次性全改 —— 但它们**只是转发**，不再是独立的一份数据。
- * 否则会出现"探测写库、列表读老表"这种数据分裂。
+ * 只在设置里打开了「同时写入浏览器收藏夹」时才会被调用 ——
+ * 数据以本地库为准，收藏夹只是个可选的镜像。
  */
+export async function ensureFolder(title) {
+  const settings = await getSettings();
+  const rootId = String(settings.rootParent || '2') === '1' ? '1' : '2';
+  const name = String(title || '').trim() || '未命名';
 
-export async function getAicuStore() {
-  const lib = await getLibrary();
-  return {
-    uid: lib.uid,
-    mixed: lib.mixed,
-    total: lib.total,
-    updatedAt: lib.updatedAt,
-    items: lib.items,
-    videos: lib.videos
+  const pick = async function (parentId, want) {
+    const children = await chrome.bookmarks.getChildren(parentId).catch(function () { return []; });
+    const hit = children.find(n => !n.url && n.title === want);
+    if (hit) return hit.id;
+    const node = await chrome.bookmarks.create({ parentId: parentId, title: want });
+    return node.id;
   };
-}
 
-export async function listAicuItems() {
-  return await listLibItems();
-}
-
-export async function mergeAicuItems(payload) {
-  const r = await upsertLibItems(payload);
-  return { added: r.added, enriched: r.enriched, total: r.total, capped: false, store: r.store };
-}
-
-/** 标记存活结论；返回**结论真的变了**的条数（老接口的返回值就是个数） */
-export async function markAicuAlive(marks) {
-  const r = await setLibStates(marks);
-  return r.changed;
-}
-
-export async function removeAicuItems(rpids) {
-  return await removeLibItems(rpids);
-}
-
-export async function clearAicuStore() {
-  // 连老的 bc_aicu 一起清掉：否则下次读库会把它当成"还没迁移过"again 迁回来
-  await chrome.storage.local.remove([K_LIBRARY, K_AICU]);
+  const container = String(settings.containerFolder || '').trim();
+  const parent = container ? await pick(rootId, container) : rootId;
+  return await pick(parent, name);
 }
 
 /** 判断是不是 B 站域名 */
@@ -629,20 +283,6 @@ const LIB_MAX_ITEMS = 20000;
 
 export const LIB_STATES = ['live', 'gone', 'deleted', 'unknown', 'unreachable'];
 
-/** 老字段 alive → 新字段 state */
-export function stateFromAlive(alive) {
-  if (alive === true) return 'live';
-  if (alive === false) return 'gone';
-  return 'unknown';
-}
-
-/** 新字段 state → 老字段 alive（只为了兼容还没改过来的调用方） */
-export function aliveFromState(state) {
-  if (state === 'live') return true;
-  if (state === 'gone') return false;
-  return undefined;
-}
-
 /**
  * 这条评论还值得为它发一次删除请求吗？
  *
@@ -665,7 +305,7 @@ export function normalizeLibItem(raw) {
   if (!base) return null;
 
   let state = String((raw && raw.state) || '').trim();
-  if (LIB_STATES.indexOf(state) < 0) state = stateFromAlive(raw && raw.alive);
+  if (LIB_STATES.indexOf(state) < 0) state = 'unknown';
 
   const out = {
     rpid: base.rpid,
@@ -675,6 +315,8 @@ export function normalizeLibItem(raw) {
     rank: base.rank,
     message: base.message,
     ctime: base.ctime,
+    // 这条是哪儿来的：record=扩展自动记录下来的（你刚发的），aicu=从 aicu 导入的历史评论
+    source: (raw && raw.source === 'record') ? 'record' : 'aicu',
     state: state
   };
 
@@ -687,10 +329,6 @@ export function normalizeLibItem(raw) {
   if (raw.bookmarkId) out.bookmarkId = String(raw.bookmarkId);
   // 上次检查的结论说明 —— 为什么是"查不到"、为什么判它没了，都记在这里给人看
   if (raw.note) out.note = String(raw.note).slice(0, 120);
-
-  // 兼容字段：老代码还在看 alive
-  const a = aliveFromState(state);
-  if (a !== undefined) out.alive = a;
 
   return out;
 }
@@ -743,29 +381,17 @@ export function videoKey(type, oid) {
   return String(Number(type)) + ':' + String(oid);
 }
 
-/**
- * 读整库。第一次读的时候会把老的 bc_aicu 清单迁移过来。
- * 迁移是"先写库、写成功了才删老键"—— 这样既不会丢数据，也不会让
- * 「清空导入」被下一次读库的迁移悄悄撤销。
- */
+/** 读整库。库里没有就返回一个空库。 */
 export async function getLibrary() {
   const o = await chrome.storage.local.get(K_LIBRARY);
   const lib = o[K_LIBRARY];
   if (lib && typeof lib === 'object' && lib.items) return normalizeLib(lib);
-
-  const legacy = await chrome.storage.local.get(K_AICU);
-  const old = legacy[K_AICU];
-  if (old && old.items) {
-    const migrated = normalizeLib({
-      uid: old.uid, mixed: old.mixed, total: old.total, items: old.items
-    });
-    // 先把库写下去，**确认写成功之后**才删老键。
-    // 留着老键的话，「清空导入」会被下一次读库的迁移悄悄撤销。
-    await chrome.storage.local.set({ [K_LIBRARY]: migrated });
-    await chrome.storage.local.remove(K_AICU);
-    return migrated;
-  }
   return emptyLib();
+}
+
+/** 整个库清掉（数据页的「删除全部」用） */
+export async function clearLibrary() {
+  await chrome.storage.local.remove(K_LIBRARY);
 }
 
 export async function saveLibrary(lib) {
@@ -802,6 +428,8 @@ export async function upsertLibItems(payload) {
       if (!prev.type && it.type) patch.type = it.type;
       if (!prev.oid && it.oid) patch.oid = it.oid;
       if ((!prev.root || prev.root === '0') && it.root && it.root !== '0') patch.root = it.root;
+      // 自己记录下来的条目比"从 aicu 导入的"更可信，优先级更高
+      if (it.source === 'record' && prev.source !== 'record') patch.source = 'record';
       // 已经查过存活结论的，不要被一次重新导入冲掉
       patch.lastSeen = now;
       if (Object.keys(patch).length > 1) {
@@ -854,7 +482,8 @@ export async function setLibStates(marks) {
 
     const raw = marks[rpid];
     const spec = (raw && typeof raw === 'object') ? raw : { state: raw };
-    const state = STATE_SET[spec.state] ? spec.state : stateFromAlive(spec.state);
+    if (!STATE_SET[spec.state]) continue;          // 状态不认识就跳过，别瞎记
+    const state = spec.state;
     const note = spec.note ? String(spec.note).slice(0, 120) : '';
 
     it.note = note;
@@ -959,13 +588,15 @@ export async function listLibItems() {
 
 export async function libraryStats() {
   const lib = await getLibrary();
-  const s = { total: 0, live: 0, gone: 0, deleted: 0, unknown: 0, unreachable: 0, videos: 0, titled: 0 };
+  const s = { total: 0, live: 0, gone: 0, deleted: 0, unknown: 0, unreachable: 0,
+              recorded: 0, imported: 0, videos: 0, titled: 0 };
   const seenVideos = {};
   for (const k of Object.keys(lib.items)) {
     const it = lib.items[k];
     const st = it.state;
     s.total++;
     if (s[st] === undefined) s.unknown++; else s[st]++;
+    if (it.source === 'record') s.recorded++; else s.imported++;
     seenVideos[videoKey(it.type, it.oid)] = 1;
   }
   s.videos = Object.keys(seenVideos).length;   // 库里涉及多少个视频
