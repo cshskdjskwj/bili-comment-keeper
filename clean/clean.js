@@ -11,6 +11,7 @@ import {
   sleep, randInt, escapeHtml, explainCode, sourceLabel, fmtTime,
   aicuTypeName, aicuCommentUrl, aicuSubUrl,
   getLibrary, listLibItems, clearLibrary, removeLibItems, setLibStates, markLibDeleted,
+  K_LIBRARY, K_SETTINGS,
   libraryStats, queryLib, getLibItems, missingVideoTitles, saveVideoTitles, videoKey,
   isDeletable,
   exportLibraryJSON, exportLibraryHTML, exportLibraryMarkdown, importLibraryJSON
@@ -152,12 +153,51 @@ function withTimeout(promise, ms, fallback) {
   ]);
 }
 
-let running = false, stopRequested = false;
+/**
+ * 「正在跑流程」的三个标志。用 `var` 是故意的：它们会挂到全局对象上，
+ * 测试里能直接摆布 —— 「巡检期间不要被自动重画插一脚」这条规则得测得到。
+ */
+var running = false;            // 删除流程
+var autoRunning = false;        // 自动翻页
+var probing = false;            // 存活探测
+let stopRequested = false;
+let probeStop = false;          // 探测的停止请求
 let workerTabId = null, workerCreated = false;
 let settings = null;
 let items = [], stats = { ok: 0, fail: 0, gone: 0 }, purgeTimer = null;
 let sourceFilter = 'all';       // 来源筛选：all | bookmark | aicu
 let logAutoOpened = false;      // 出错后日志是否已经自动展开过
+
+/**
+ * 库一变就自动重画。
+ *
+ * 为什么要盯着 storage 而不是等后台广播：**广播要一处一处记得发**。
+ * 之前发一条评论，后台写完库就悄悄结束了，面板压根不知道 —— 界面要关掉重开才更新。
+ * 盯着存储本身，任何写入路径（现在和将来的）都会自动反映出来。
+ */
+let libWatchTimer = null;
+
+function scheduleLibraryRefresh() {
+  // 巡检和删除这两个流程自己会刷新界面，别和它们打架
+  if (probing || running || autoRunning) return;
+  if (libWatchTimer) clearTimeout(libWatchTimer);
+  libWatchTimer = setTimeout(function () {
+    libWatchTimer = null;
+    refreshLibrary().catch(function () {});
+    loadArchive().catch(function () {});
+  }, 300);
+}
+
+chrome.storage.onChanged.addListener(function (changes, area) {
+  if (area !== 'local') return;
+
+  if (changes[K_LIBRARY]) scheduleLibraryRefresh();
+
+  // 设置被改了（比如在设置页关了自动记录），面板里那份缓存也要跟着换
+  if (changes[K_SETTINGS]) {
+    getSettings().then(function (s) { settings = s; }).catch(function () {});
+  }
+});
 
 chrome.runtime.onMessage.addListener(function (msg) {
   if (!msg) return;
@@ -393,9 +433,6 @@ async function loadArchive() {
 
 const AICU_RENDER_LIMIT = 200;
 
-let autoRunning = false;        // 自动翻页是否正在进行
-let probing = false;            // 存活探测是否正在进行
-let probeStop = false;          // 探测的停止请求
 let aicuRenderTimer = null;     // 导入区重绘节流
 
 /**
@@ -2190,8 +2227,7 @@ async function start() {
 
   let aborted = false;
   let timeoutFails = 0;            // 连续「等不到页面回话」的条数
-  const deletedRpids = [];         // 删成功的 rpid，最后交回后台清索引
-  const deletedAicuRpids = [];     // 其中来自 aicu 导入的，要从导入清单里移除
+  const deletedRpids = [];         // 删成功的 rpid，交回后台标成"已删除"
 
   // 每条都要真调一次接口（删除接口本身就是"这条还在不在"的判据），
   // 所以先把预计耗时说清楚，别让人以为卡住了。
@@ -2242,7 +2278,6 @@ async function start() {
         }
         stats.ok++;
         deletedRpids.push(t.rpid);
-        if (it.source === 'aicu') deletedAicuRpids.push(t.rpid);
         log('✓ ' + label(it) + (r.ok ? ' 已删除' : ' 早就被删了'));
       } else {
         it.status = 'failed';
@@ -2283,7 +2318,10 @@ async function start() {
   }
 
   await forgetRpids(deletedRpids);
-  await removeLibItems(deletedAicuRpids);
+
+  // 注意：**不要**把删掉的条目从库里移除。
+  // 收藏夹时代，"归档"是那条书签挪到「已删除评论」目录，所以导入清单可以清掉；
+  // 现在书签没了，archive() 把条目留成 state='deleted' 就是那份账本 —— 清掉就等于账本丢了。
   await refreshBadge();
 
   if (workerCreated && workerTabId !== null) {
@@ -2303,7 +2341,7 @@ async function start() {
   const left = items.filter(i => i.status !== 'done').length;
   const goneText = stats.gone ? `，其中 ${stats.gone} 条 B 站上早就没有了` : '';
   if (stats.fail === 0 && !aborted) {
-    setHint(`全部搞定：本次处理 ${stats.ok} 条${goneText}。书签类已归档，aicu 导入的已从清单移除。列表里还剩 ${left} 条。`, '');
+    setHint(`全部搞定：本次处理 ${stats.ok} 条${goneText}。删掉的条目留在库里，标成「已删除」当账本。队列里还剩 ${left} 条。`, '');
   } else {
     setHint(`本次成功 ${stats.ok} 条${goneText}，失败 ${stats.fail} 条。失败的条目仍然在库里里，日志里有原因，修好后可点「重试失败项」。`, 'warn');
   }

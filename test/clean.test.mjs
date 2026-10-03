@@ -88,6 +88,7 @@ async function makeSandbox(injectHook, opts) {
   const posts = [];              // 模拟页面发出的 postMessage
   const worlds = [];             // 记录每次注入用的世界（MAIN / ISOLATED）
 
+  const changeListeners = [];
   const localData = new Map();
   const seed = (opts && opts.seed) || {};
   for (const k of Object.keys(seed)) localData.set(k, seed[k]);
@@ -117,6 +118,10 @@ async function makeSandbox(injectHook, opts) {
         async remove(keys) {
           for (const k of (Array.isArray(keys) ? keys : [keys])) localData.delete(k);
         }
+      },
+      // 面板靠它感知"库变了"（发评论后要立刻刷新，不能等用户关掉重开）
+      onChanged: {
+        addListener(fn) { changeListeners.push(fn); }
       }
     },
     bookmarks: {
@@ -181,7 +186,11 @@ async function makeSandbox(injectHook, opts) {
   vm.createContext(sandbox);
   vm.runInContext(SRC, sandbox, { filename: 'clean.js' });
 
-  return { sandbox, pageStore, posts, worlds, localData, els: ownEls };
+  const fireStorageChange = (changes, area) => {
+    for (const fn of changeListeners) fn(changes, area || 'local');
+  };
+
+  return { sandbox, pageStore, posts, worlds, localData, els: ownEls, fireStorageChange };
 }
 
 console.log('\n删除链路（clean.js）回归测试\n');
@@ -948,6 +957,68 @@ await test('库列表里同时带状态标签和来源标签', async () => {
   });
   assert.match(html, /tag live[^>]*>还在/);
   assert.match(html, /tag rec[^>]*>记录/);
+});
+
+console.log('\n— 库一变，界面自己刷新 —');
+
+await test('库变了就自动重画，不用关掉重开（用户反馈的就是这个）', async () => {
+  const { sandbox, els, fireStorageChange } = await makeSandbox(async () => [{ result: undefined }], {
+    seed: seedLibrary([libItem('1', 'live')])
+  });
+
+  await sandbox.refreshLibrary();
+  assert.equal(String(els.get('lib-total').textContent), '1', '先确认渲染出来的是 1 条');
+
+  // 模拟"又发了一条评论"：后台写库 + 存储变化事件
+  await sandbox.upsertLibItems({ items: [libItem('2', 'live', { ctime: 1700000900 })] });
+  fireStorageChange({ bc_library: { newValue: {} } });
+
+  await new Promise(r => setTimeout(r, 500));   // 防抖 300ms
+
+  assert.equal(String(els.get('lib-total').textContent), '2', '界面该自己更新成 2 条');
+});
+
+await test('无关的存储变化不触发重画', async () => {
+  const { sandbox, els, fireStorageChange } = await makeSandbox(async () => [{ result: undefined }], {
+    seed: seedLibrary([libItem('1', 'live')])
+  });
+  await sandbox.refreshLibrary();
+  const before = els.get('lib-total').textContent;
+
+  fireStorageChange({ 别的东西: { newValue: 1 } });
+  await new Promise(r => setTimeout(r, 500));
+
+  assert.equal(String(els.get('lib-total').textContent), String(before));
+});
+
+await test('巡检进行中不做自动重画 —— 那两个流程自己会刷，别打架', async () => {
+  const { sandbox, els, fireStorageChange } = await makeSandbox(async () => [{ result: undefined }], {
+    seed: seedLibrary([libItem('1', 'live'), libItem('2', 'unknown')])
+  });
+  await sandbox.refreshLibrary();
+
+  sandbox.probing = true;                       // 伪造"正在巡检"
+  await sandbox.upsertLibItems({ items: [libItem('3', 'live')] });
+  fireStorageChange({ bc_library: { newValue: {} } });
+  await new Promise(r => setTimeout(r, 500));
+
+  assert.notEqual(String(els.get('lib-total').textContent), '3', '巡检期间不该被自动重画插一脚');
+});
+
+await test('手动在 B 站网页上删了评论，界面也要自己反映出来', async () => {
+  const { sandbox, els, fireStorageChange } = await makeSandbox(async () => [{ result: undefined }], {
+    seed: seedLibrary([libItem('1', 'live'), libItem('2', 'live')])
+  });
+  await sandbox.refreshLibrary();
+  assert.equal(String(els.get('lib-deleted').textContent), '0');
+
+  // 后台 handleDeleted 干的事：把这条标成 deleted（会写库 → 触发存储变化）
+  await sandbox.markLibDeleted(['1']);
+  fireStorageChange({ bc_library: { newValue: {} } });
+  await new Promise(r => setTimeout(r, 500));
+
+  assert.equal(String(els.get('lib-deleted').textContent), '1', '「已删除」那一格该自己跳上去');
+  assert.equal(String(els.get('lib-live').textContent), '1', '「还在」相应减一');
 });
 
 /* ---------------------------------------------------------------- 汇总 */

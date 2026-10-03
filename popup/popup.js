@@ -6,7 +6,7 @@
  */
 
 import {
-  getSettings, setSettings, libraryStats, fmtTime
+  getSettings, setSettings, libraryStats, fmtTime, K_LIBRARY, K_SETTINGS
 } from '../src/shared.js';
 
 const $ = id => document.getElementById(id);
@@ -61,7 +61,13 @@ $('btn-settings').addEventListener('click', function () {
   window.close();
 });
 
-// 后台发现你「在 B 站网页上手动删了评论」并归档书签、或者 aicu 又抓到新数据时，弹窗跟着刷新
+// 库或设置一变就重画（发评论后立刻能看到数字跳）
+chrome.storage.onChanged.addListener(function (changes, area) {
+  if (area !== 'local') return;
+  if (changes[K_LIBRARY] || changes[K_SETTINGS]) render().catch(function () {});
+});
+
+// 后台归档 / aicu 抓到新数据时也刷新
 chrome.runtime.onMessage.addListener(function (msg) {
   if (msg && (msg.type === 'SYNC_ARCHIVED' || msg.type === 'AICU_UPDATED')) {
     render().catch(function () {});

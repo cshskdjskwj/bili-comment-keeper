@@ -5,6 +5,56 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.8.1] - 2026-10-04
+
+### 修复
+
+- **发完评论界面不会自己更新，要关掉重开**（用户实测反馈）
+
+  后台写完库就悄悄结束了 —— `handleRecord` 成功之后**没有广播任何事件**，
+  而面板只监听 `AICU_UPDATED` / `SYNC_ARCHIVED` / `DELETE_RESULT`，
+  所以它压根不知道库里多了东西。
+
+  修法不是"补一条广播" —— 那样以后每加一个写入路径都得记得广播。
+  改成**面板直接监听库本身的变化**（`chrome.storage.onChanged`）：
+
+  ```js
+  chrome.storage.onChanged.addListener(function (changes, area) {
+    if (area !== 'local') return;
+    if (changes[K_LIBRARY]) scheduleLibraryRefresh();
+    ...
+  });
+  ```
+
+  任何写入路径（现在和将来的）都会自动反映到界面上。
+
+  **手动在 B 站网页上删评论也是同一个坑** —— 面板收到 `SYNC_ARCHIVED` 时
+  只更新了删除队列里那一行，库视图没动。这个改动一并覆盖了它（用户反馈的第二点）。
+
+  两个细节：重画做了 300ms 防抖；**巡检 / 删除进行中不参与自动重画** ——
+  那两个流程本来就按自己的节奏刷界面，别打架。
+
+- **删除成功后，账本被误删**（自查中发现）
+
+  删除流程跑完会调 `removeLibItems(deletedAicuRpids)` 把 aicu 导入的条目**从库里整个删掉**。
+  那是收藏夹时代的残留：当年"归档"是书签挪到「已删除评论」目录，所以导入清单可以清掉。
+  现在书签没了，`archive()` 把条目留成 `state='deleted'` **就是那份账本** ——
+  再删掉等于账本丢了，「已删除记录」永远是空的。已去掉这一步。
+
+### 新增测试
+
+[`test/clean.test.mjs`](test/clean.test.mjs) 增到 **59 项**，新增 4 项：
+
+- **库变了就自动重画**（直接复现用户报的场景：写完库 + 触发存储变化 → 界面从 1 条变 2 条）；
+- **手动删评论后界面自己反映**（「已删除」跳 1、「还在」减 1）；
+- 无关的存储变化不触发重画；
+- 巡检进行中不做自动重画。
+
+为此把测试沙箱的 `chrome.storage.onChanged` 也做成了可触发的；
+`running` / `autoRunning` / `probing` 三个流程标志改用 `var`（挂到全局，测试才摆布得了）。
+
+全套现在 **136 项**，并通过 Edge `--pack-extension` 打包验证。
+
 ## [1.8.0] - 2026-10-04
 
 **界面拆成三个页面：主页（评论库）、导入历史、数据与存储。**
