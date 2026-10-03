@@ -25,9 +25,12 @@
         <span class="metric ok"><b id="lib-live">0</b><i>还在</i></span>
         <span class="metric mute"><b id="lib-gone">0</b><i>已没了</i></span>
         <span class="metric bad"><b id="lib-deleted">0</b><i>已删除</i></span>
-        <span class="metric warn"><b id="lib-unknown">0</b><i>未检查</i></span>
+        <span class="metric warn"><b id="lib-unreachable">0</b><i>查不到</i></span>
+        <span class="metric mute"><b id="lib-unknown">0</b><i>未检查</i></span>
       </div>
       <div class="eta" id="lib-updated"></div>
+      <!-- 巡检时才有：不然进度只是提示框里的一串数字，看不出在动 -->
+      <div class="progress hide" id="probe-bar"><i id="probe-progress"></i></div>
     </section>
 
     <section class="toolbar">

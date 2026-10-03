@@ -627,7 +627,7 @@ export const K_LIBRARY = 'bc_library';
 const LIB_VERSION = 2;
 const LIB_MAX_ITEMS = 20000;
 
-export const LIB_STATES = ['live', 'gone', 'deleted', 'unknown'];
+export const LIB_STATES = ['live', 'gone', 'deleted', 'unknown', 'unreachable'];
 
 /** 老字段 alive → 新字段 state */
 export function stateFromAlive(alive) {
@@ -646,16 +646,17 @@ export function aliveFromState(state) {
 /**
  * 这条评论还值得为它发一次删除请求吗？
  *
- *   live    值得 —— 确认还在
- *   unknown 值得 —— 还没查过，删一次正好当探测
- *   gone    **不值得** —— 已经没了，再问一次只会拿到 12022
- *   deleted **不值得** —— 我们自己已经删过了
+ *   live        值得 —— 确认还在
+ *   unknown     值得 —— 还没查过，删一次正好当探测
+ *   unreachable 值得 —— 查不到（视频不可访问之类），但**不能因为查不到就当它没了**
+ *   gone        **不值得** —— 已经没了，再问一次只会拿到 12022
+ *   deleted     **不值得** —— 我们自己已经删过了
  *
  * 这是 v1.3 做存活探测的初衷：别为早就没了的评论浪费请求。
  * 所以任何"进删除队列"的入口都必须过这一关。
  */
 export function isDeletable(state) {
-  return state === 'live' || state === 'unknown';
+  return state === 'live' || state === 'unknown' || state === 'unreachable';
 }
 
 /** 规整库里的一条记录；缺 rpid / type / oid 就返回 null */
@@ -684,6 +685,8 @@ export function normalizeLibItem(raw) {
   if (ts(raw.firstSeen)) out.firstSeen = ts(raw.firstSeen);
   if (ts(raw.lastSeen)) out.lastSeen = ts(raw.lastSeen);
   if (raw.bookmarkId) out.bookmarkId = String(raw.bookmarkId);
+  // 上次检查的结论说明 —— 为什么是"查不到"、为什么判它没了，都记在这里给人看
+  if (raw.note) out.note = String(raw.note).slice(0, 120);
 
   // 兼容字段：老代码还在看 alive
   const a = aliveFromState(state);
@@ -829,11 +832,15 @@ export async function upsertLibItems(payload) {
   return { added: added, enriched: enriched, total: count, store: lib };
 }
 
-const STATE_SET = { live: 1, gone: 1, deleted: 1, unknown: 1 };
+const STATE_SET = { live: 1, gone: 1, deleted: 1, unknown: 1, unreachable: 1 };
 
 /**
- * 记下一批存活结论。marks 形如 { rpid: 'live' | 'gone' | 'unknown' }（也接受 true/false）。
+ * 记下一批存活结论。marks 形如
+ *   { rpid: 'live' | 'gone' | 'unknown' | 'unreachable' }
+ * 也接受 `{ rpid: { state, note } }` 和老的 true/false 写法。
+ *
  * 会顺手记下检查时间；**第一次发现它没了的时候**记下 goneAt。
+ * `note` 是"为什么得出这个结论"，会存下来给人看 —— 光显示"查不到"没法排查。
  */
 export async function setLibStates(marks) {
   const lib = await getLibrary();
@@ -846,13 +853,14 @@ export async function setLibStates(marks) {
     if (!it) continue;
 
     const raw = marks[rpid];
-    const state = STATE_SET[raw] ? raw : stateFromAlive(raw);
-    if (it.state === state) {
-      // 结论没变也要更新检查时间，这样才看得出"上次巡检是什么时候"
-      it.aliveCheckedAt = now;
-      touched++;
-      continue;
-    }
+    const spec = (raw && typeof raw === 'object') ? raw : { state: raw };
+    const state = STATE_SET[spec.state] ? spec.state : stateFromAlive(spec.state);
+    const note = spec.note ? String(spec.note).slice(0, 120) : '';
+
+    it.note = note;
+    it.aliveCheckedAt = now;
+
+    if (it.state === state) { touched++; continue; }
 
     if (state === 'live') {
       // 又活了（或者之前判错了），把"没了"的痕迹清掉
@@ -861,7 +869,6 @@ export async function setLibStates(marks) {
       it.goneAt = now;
     }
     it.state = state;
-    it.aliveCheckedAt = now;
     changed++;
   }
 
@@ -952,7 +959,7 @@ export async function listLibItems() {
 
 export async function libraryStats() {
   const lib = await getLibrary();
-  const s = { total: 0, live: 0, gone: 0, deleted: 0, unknown: 0, videos: 0, titled: 0 };
+  const s = { total: 0, live: 0, gone: 0, deleted: 0, unknown: 0, unreachable: 0, videos: 0, titled: 0 };
   const seenVideos = {};
   for (const k of Object.keys(lib.items)) {
     const it = lib.items[k];
@@ -1037,7 +1044,7 @@ const esc = s => String(s === undefined || s === null ? '' : s)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
-const STATE_TEXT = { live: '还在', gone: '已没了', deleted: '已删除', unknown: '未检查' };
+const STATE_TEXT = { live: '还在', gone: '已没了', deleted: '已删除', unknown: '未检查', unreachable: '查不到' };
 
 export function stateText(state) {
   return STATE_TEXT[state] || STATE_TEXT.unknown;
@@ -1084,7 +1091,7 @@ export async function exportLibraryHTML(title) {
   const items = sortedForExport(lib);
   const heading = String(title || ('B 站评论备份 · UID ' + (lib.uid || '未知')));
 
-  const counts = { live: 0, gone: 0, deleted: 0, unknown: 0 };
+  const counts = { live: 0, gone: 0, deleted: 0, unknown: 0, unreachable: 0 };
   for (const it of items) counts[it.state] = (counts[it.state] || 0) + 1;
 
   const rows = items.map(it => {
@@ -1138,7 +1145,8 @@ export async function exportLibraryHTML(title) {
 <h1>${esc(heading)}</h1>
 <div class="sum">
   共 ${items.length} 条　·　还在 ${counts.live || 0}　·　已没了 ${counts.gone || 0}　·　
-  已删除 ${counts.deleted || 0}　·　未检查 ${counts.unknown || 0}<br>
+  已删除 ${counts.deleted || 0}　·　未检查 ${counts.unknown || 0}　·　
+  查不到 ${counts.unreachable || 0}<br>
   导出时间 ${esc(fmtTime(Date.now()))}
 </div>
 <ul>
@@ -1155,14 +1163,14 @@ export async function exportLibraryMarkdown(title) {
   const items = sortedForExport(lib);
   const heading = String(title || ('B 站评论备份 · UID ' + (lib.uid || '未知')));
 
-  const counts = { live: 0, gone: 0, deleted: 0, unknown: 0 };
+  const counts = { live: 0, gone: 0, deleted: 0, unknown: 0, unreachable: 0 };
   for (const it of items) counts[it.state] = (counts[it.state] || 0) + 1;
 
   const lines = [
     '# ' + heading,
     '',
     `共 ${items.length} 条　·　还在 ${counts.live || 0}　·　已没了 ${counts.gone || 0}　·　` +
-      `已删除 ${counts.deleted || 0}　·　未检查 ${counts.unknown || 0}`,
+      `已删除 ${counts.deleted || 0}　·　未检查 ${counts.unknown || 0}　·　查不到 ${counts.unreachable || 0}`,
     '',
     `导出时间：${fmtTime(Date.now())}`,
     ''

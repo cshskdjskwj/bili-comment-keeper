@@ -419,14 +419,49 @@ await test('导出 Markdown：正文里的换行不会把结构撑坏', async ()
   assert.ok(bodyLines[0].startsWith('> '), '多行正文要走引用块，不能裸着插进来');
 });
 
-await test('准入规则：只有 live / unknown 值得为它发一次删除请求', async () => {
+await test('准入规则：只有 live / unknown / unreachable 值得为它发一次删除请求', async () => {
   const { isDeletable } = shared;
   assert.equal(isDeletable('live'), true, '确认还在 —— 该删');
   assert.equal(isDeletable('unknown'), true, '还没查过 —— 删一次正好当探测');
+  assert.equal(isDeletable('unreachable'), true,
+    '查不到 ≠ 没了 —— 视频不可访问时评论可能还在，不能因为查不到就把它排除掉');
   assert.equal(isDeletable('gone'), false, '已经没了 —— 再问只会拿到 12022，白费一次请求');
   assert.equal(isDeletable('deleted'), false, '我们自己删过了 —— 同理');
   assert.equal(isDeletable(undefined), false, '状态不明的一律不放行');
   assert.equal(isDeletable('乱七八糟'), false);
+});
+
+await test('unreachable 是独立的一态：计数、筛选、文案都要有它', async () => {
+  localData.clear();
+  await upsertLibItems({ uid: 'u', items: [item('1'), item('2'), item('3')] });
+  await setLibStates({ 1: 'live', 2: 'unreachable', 3: 'gone' });
+
+  const s = await libraryStats();
+  assert.equal(s.unreachable, 1, '统计里要有这一格');
+  assert.equal(s.live, 1);
+  assert.equal(s.gone, 1);
+
+  const only = await queryLib({ states: ['unreachable'] });
+  assert.equal(only.total, 1, '要能单独筛出来');
+  assert.equal(only.items[0].rpid, '2');
+
+  assert.equal(shared.stateText('unreachable'), '查不到');
+});
+
+await test('检查结论的原因会存下来（光显示"查不到"没法排查）', async () => {
+  localData.clear();
+  await upsertLibItems({ uid: 'u', items: [item('1')] });
+
+  await setLibStates({ 1: { state: 'unreachable', note: '视频/评论区访问不到（啥都木有）' } });
+  let lib = await getLibrary();
+  assert.equal(lib.items['1'].state, 'unreachable');
+  assert.match(lib.items['1'].note, /访问不到/);
+
+  // 换成别的结论时原因要跟着换，不能留着旧的那句
+  await setLibStates({ 1: { state: 'live' } });
+  lib = await getLibrary();
+  assert.equal(lib.items['1'].state, 'live');
+  assert.ok(!lib.items['1'].note, '换了结论就不该留着上一次的原因');
 });
 
 /* ---------------------------------------------------------------- 汇总 */

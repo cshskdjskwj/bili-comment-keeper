@@ -463,22 +463,109 @@ await test('楼中楼：会话还在但本人不在里面 → 已删（样本2�
   assert.equal(r.alive, false, '翻完会话都没有本人 → 判定为已删');
 });
 
-await test('楼中楼：会话太长没翻完 → 「不确定」，不能当成已删', async () => {
-  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
-  sandbox.fetch = async (url) => {
-    if (/ps=1/.test(url)) {
-      return { status: 200, text: async () => JSON.stringify({ code: 0, data: { root: { rpid: 111 } } }) };
+/** 造一条按时间升序的长会话，供楼中楼定位测试用 */
+function makeThread(opts) {
+  const TOTAL = opts.total;
+  const PAGE = 20;
+  const T0 = 1700000000;
+  const targetRpid = opts.targetRpid;
+  const targetIndex = opts.targetIndex;      // 从 0 开始
+  const seen = [];
+
+  const fetch = async (url) => {
+    // 第一次查本人：B 站把二级评论解析到会话根
+    if (/ps=1(&|$)/.test(url)) {
+      return {
+        status: 200,
+        text: async () => JSON.stringify({ code: 0, data: { root: { rpid: opts.rootId } } })
+      };
     }
-    // 每次都返回一堆别人的评论，而且 count 远大于我们翻过的量
+    const pn = Number((/pn=(\d+)/.exec(url) || [])[1] || 1);
+    const ps = Number((/ps=(\d+)/.exec(url) || [])[1] || 0);
+    seen.push({ pn: pn, ps: ps });
+
+    const list = [];
+    for (let k = 0; k < PAGE; k++) {
+      const idx = (pn - 1) * PAGE + k;
+      if (idx >= TOTAL) break;
+      list.push({
+        rpid: idx === targetIndex ? targetRpid : String(1000000 + idx),
+        ctime: T0 + idx
+      });
+    }
     return {
       status: 200,
-      text: async () => JSON.stringify({ code: 0, data: { replies: [{ rpid: 7 }], page: { count: 9999 } } })
+      text: async () => JSON.stringify({ code: 0, data: { replies: list, page: { count: TOTAL } } })
     };
   };
 
-  const r = await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '222' });
-  assert.equal(r.alive, null, '没确认完就不能下结论');
-  assert.match(r.message, /太长/);
+  return { fetch, seen, ctimeOf: i => T0 + i };
+}
+
+await test('楼中楼：在很长的会话里也能找到本人（用户反馈的就是这种）', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+
+  // 200 条、每页 20 → 共 10 页；本人排在第 131 条（第 7 页）。
+  // 老逻辑写 ps=49 却只拿到 20 条，翻 3 页就"以为翻完了"，于是判成未检查。
+  const th = makeThread({ total: 200, targetIndex: 130, targetRpid: '999', rootId: '111' });
+  sandbox.fetch = th.fetch;
+
+  const r = await sandbox.checkAliveOne({
+    type: 1, oid: '5', rpid: '999', ctime: th.ctimeOf(130)
+  });
+
+  assert.equal(r.state, 'live', `应该找到本人，实际 state=${r.state}／note=${r.message}`);
+  assert.ok(th.seen.length <= 8,
+    `按时间二分定位不该翻很多页，实际翻了 ${th.seen.length} 页：` +
+    th.seen.map(x => x.pn).join(','));
+});
+
+await test('楼中楼：请求必须用 ps=20 —— B 站把每页硬限制在 20，写 49 只是自欺欺人', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const th = makeThread({ total: 60, targetIndex: 25, targetRpid: '999', rootId: '111' });
+  sandbox.fetch = th.fetch;
+
+  await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '999', ctime: th.ctimeOf(25) });
+
+  assert.ok(th.seen.length > 0);
+  for (const s of th.seen) {
+    assert.equal(s.ps, 20, `翻会话必须用 ps=20，实际 ps=${s.ps}`);
+  }
+});
+
+await test('楼中楼：时间定位到了却不在那一带 → 判定为已删', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  // 会话 200 条，但"本人"根本不在里面
+  const th = makeThread({ total: 200, targetIndex: -1, targetRpid: '999', rootId: '111' });
+  sandbox.fetch = th.fetch;
+
+  const r = await sandbox.checkAliveOne({
+    type: 1, oid: '5', rpid: '999', ctime: th.ctimeOf(130)
+  });
+
+  assert.equal(r.state, 'gone', `实际 state=${r.state}／note=${r.message}`);
+  assert.match(r.message, /没有它|已经没有/);
+});
+
+await test('楼中楼：没有时间戳就不下结论，并且说清为什么', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const th = makeThread({ total: 200, targetIndex: 130, targetRpid: '999', rootId: '111' });
+  sandbox.fetch = th.fetch;
+
+  const r = await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '999' });   // 没有 ctime
+  assert.equal(r.state, 'unknown', '定位不了就别乱判');
+  assert.match(r.message, /时间/);
+});
+
+await test('查不到：视频不可访问（-404）单独归为 unreachable，不能混进"未检查"', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.fetch = async () => ({
+    status: 200, text: async () => JSON.stringify({ code: -404, message: '啥都木有' })
+  });
+
+  const r = await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '999' });
+  assert.equal(r.state, 'unreachable');
+  assert.match(r.message, /访问不到/, `原因要说清，实际：${r.message}`);
 });
 
 await test('探测拿不准时的原因会原样带出来（便于排查）', async () => {

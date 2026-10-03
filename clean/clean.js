@@ -719,7 +719,7 @@ async function probeAicuAlive() {
   setAicuHint(`正在只读探测存活：本次 ${todo.length} 条，预计约 ${estMin} 分钟。` +
     '这不会删任何东西，只是问 B 站「这条还在不在」。中途可以点「停止」，测过的会记住。', '');
 
-  let alive = 0, gone = 0, unknown = 0, errStreak = 0;
+  let alive = 0, gone = 0, unknown = 0, unreachable = 0, errStreak = 0;
   const marks = {};
 
   const flush = async function () {
@@ -727,6 +727,17 @@ async function probeAicuAlive() {
     await markAicuAlive(marks);
     for (const k of Object.keys(marks)) delete marks[k];
   };
+
+  // 进度条 + 列表即时刷新：不这样，巡检时界面是死的，看不出在动
+  const bar = $('probe-bar');
+  const inner = $('probe-progress');
+  if (bar) bar.classList.remove('hide');
+  const setBar = (done, total) => {
+    if (inner) inner.style.width = (total ? Math.round(done / total * 100) : 0) + '%';
+  };
+  setBar(0, todo.length);
+
+  let lastPaint = 0;
 
   for (let i = 0; i < todo.length; i++) {
     if (probeStop) break;
@@ -736,22 +747,24 @@ async function probeAicuAlive() {
 
     // 每条都带上限。外层再兜一层，是为了"就算 checkAliveOne 本身出了意料之外的问题，
     // 循环也一定能往下走" —— 这个功能已经因为一处不 settle 的 await 卡死过一次了。
-    let r = { alive: null, message: '内部超时' };
+    let r = { state: 'unknown', alive: null, message: '内部超时' };
     try {
-      r = await withTimeout(checkAliveOne(it), 25000, { alive: null, message: '这条探测超时（25 秒）' });
+      r = await withTimeout(checkAliveOne(it), 40000,
+        { state: 'unknown', alive: null, message: '这条探测超时（40 秒）' });
     } catch (e) {
-      r = { alive: null, message: '探测出错：' + ((e && e.message) || e) };
+      r = { state: 'unknown', alive: null, message: '探测出错：' + ((e && e.message) || e) };
     }
 
     const took = Date.now() - startedAt;
+    const state = r.state || (r.alive === true ? 'live' : r.alive === false ? 'gone' : 'unknown');
+    // 原因一律记下来 —— 光显示"未检查"，事后根本没法排查
+    marks[it.rpid] = { state: state, note: r.message || '' };
 
-    if (r.alive === true) {
-      alive++; marks[it.rpid] = true; errStreak = 0;
-    } else if (r.alive === false) {
-      gone++; marks[it.rpid] = false; errStreak = 0;
-    } else {
+    if (state === 'live') { alive++; errStreak = 0; }
+    else if (state === 'gone') { gone++; errStreak = 0; }
+    else if (state === 'unreachable') { unreachable++; errStreak = 0; }
+    else {
       unknown++;
-      // 把"问不出来"的原因写进日志，不然只剩一个数字，没法排查
       log(`探测 ${i + 1}/${todo.length} rpid ${it.rpid}：没问出结果（${took} 毫秒，${r.message || '无说明'}）`);
       // 连续问不出结果，多半是触发风控了，歇一会儿
       if (++errStreak >= 3) {
@@ -761,20 +774,30 @@ async function probeAicuAlive() {
       }
     }
 
-    // 每条都刷新一次，别让人以为卡住了；顺便报一下上一条花了多久
+    setBar(i + 1, todo.length);
     await flush();
-    setAicuHint(`探测中 ${i + 1}/${todo.length}（上一条 ${took} 毫秒）—— 还在 ${alive} 条，`
-      + `已经没了 ${gone} 条，没问出结果 ${unknown} 条。（只读，不会删东西）`, '');
+
+    // 列表每 1.5 秒重画一次就够了 —— 每条都重画会把滚动位置晃得没法看
+    if (Date.now() - lastPaint > 1500 || i === todo.length - 1) {
+      lastPaint = Date.now();
+      await refreshLibrary();
+    }
+
+    setAicuHint(`探测中 ${i + 1}/${todo.length}（${Math.round((i + 1) / todo.length * 100)}%，` +
+      `上一条 ${took} 毫秒）—— 还在 ${alive}，已经没了 ${gone}，查不到 ${unreachable}，` +
+      `没问出结果 ${unknown}。`, '');
 
     if (i < todo.length - 1) await sleep(BC_PROBE_DELAY_MS);
   }
 
   await flush();
   setAicuProbing(false);
+  if (bar) bar.classList.add('hide');
   await loadAicu();
 
   const tail = probeStop ? '　（你让它停了，下次会接着探剩下的）' : '';
-  setAicuHint(`探测结束：还在 ${alive} 条，已经没了 ${gone} 条，没问出结果 ${unknown} 条。` +
+  setAicuHint(`探测结束：还在 ${alive} 条，已经没了 ${gone} 条，查不到 ${unreachable} 条，` +
+    `没问出结果 ${unknown} 条。` +
     `「加入待删列表」只会收下还活着的那些。${tail}`, 'warn');
 }
 
@@ -1033,6 +1056,7 @@ const LIB_STATE_TAG = {
   live: '<i class="tag live">还在</i>',
   gone: '<i class="tag gone">已没了</i>',
   deleted: '<i class="tag deleted">已删除</i>',
+  unreachable: '<i class="tag unreachable">查不到</i>',
   unknown: '<i class="tag">未检查</i>'
 };
 
@@ -1041,6 +1065,7 @@ const LIB_FILTERS = [
   { id: 'live', label: '还在' },
   { id: 'gone', label: '已没了' },
   { id: 'deleted', label: '已删除' },
+  { id: 'unreachable', label: '查不到' },
   { id: 'unknown', label: '未检查' }
 ];
 
@@ -1056,6 +1081,11 @@ function libRowHtml(it) {
   const c0 = aicuCommentUrl(it);
   const c2 = aicuSubUrl(it);
 
+  // 上次检查的结论说明。「查不到」和「未检查」光看标签分不出原因，得把话写出来。
+  const note = it.note
+    ? `<div class="lrow-note">${escapeHtml(it.note)}</div>`
+    : '';
+
   return `<div class="lrow s-${escapeHtml(it.state)}" data-rpid="${escapeHtml(it.rpid)}">
     <input type="checkbox" class="ck" ${libSelected.has(it.rpid) ? 'checked' : ''}>
     <div class="lrow-main">
@@ -1063,6 +1093,7 @@ function libRowHtml(it) {
       <div class="lrow-vid">${escapeHtml(title)}${v && v.owner ? '　·　UP ' + escapeHtml(v.owner) : ''}</div>
       <div class="lrow-meta">${escapeHtml(when)}　·　${escapeHtml(aicuTypeName(it.type))}　·　${kind}
         　·　rpid ${escapeHtml(it.rpid)}${it.aliveCheckedAt ? '　·　查于 ' + escapeHtml(fmtTime(it.aliveCheckedAt)) : ''}</div>
+      ${note}
     </div>
     <div class="lrow-links">
       ${c0 ? `<a href="${escapeHtml(c0)}" target="_blank" rel="noreferrer">方式0</a>` : ''}
@@ -1081,7 +1112,10 @@ function libPagerHtml(total) {
 }
 
 function renderLibFilters(s) {
-  const counts = { all: s.total, live: s.live, gone: s.gone, deleted: s.deleted, unknown: s.unknown };
+  const counts = {
+    all: s.total, live: s.live, gone: s.gone,
+    deleted: s.deleted, unknown: s.unknown, unreachable: s.unreachable
+  };
   $('lib-states').innerHTML = LIB_FILTERS.map(function (f) {
     const on = (f.id === 'all' && !libStates.length) || (libStates.length === 1 && libStates[0] === f.id);
     return `<button class="chip${on ? ' on' : ''}" data-state="${f.id}">${f.label} <b>${counts[f.id] || 0}</b></button>`;
@@ -1106,6 +1140,7 @@ async function refreshLibrary() {
   $('lib-gone').textContent = s.gone;
   $('lib-deleted').textContent = s.deleted;
   $('lib-unknown').textContent = s.unknown;
+  $('lib-unreachable').textContent = s.unreachable;
   $('aicu-count').textContent = s.total;
 
   const bits = [];
@@ -1136,11 +1171,16 @@ async function refreshLibrary() {
     ? `第 ${libPage * LIB_PAGE_SIZE + 1}–${Math.min(r.total, (libPage + 1) * LIB_PAGE_SIZE)} 条，共 ${r.total} 条`
     : (filtering ? '没有匹配的评论' : '库里还没有评论');
 
-  $('list').innerHTML = r.items.length
+  // 巡检期间这个函数会被反复调用；不保住滚动位置的话列表会一直往回跳，没法看
+  const listEl = $('list');
+  const keepScroll = listEl.scrollTop;
+
+  listEl.innerHTML = r.items.length
     ? r.items.map(libRowHtml).join('')
     : `<div class="empty" style="padding:18px">${escapeHtml(filtering
         ? '没有匹配的评论，换个词或者把筛选放宽。'
-        : '库里还没有评论。展开下面的「从 aicu.cc 抓取更多评论」开始。')}</div>`;
+        : '库里还没有评论。点右上角的「导入历史」开始。')}</div>`;
+  if (keepScroll) listEl.scrollTop = keepScroll;
 
   $('lib-pager').innerHTML = libPagerHtml(r.total);
 
@@ -1668,6 +1708,14 @@ function interpretReplyCheck(json) {
   if (json.code === 12006) {
     return { alive: false, code: 12006, message: json.message || '没有该评论' };
   }
+  // -404「啥都木有」：视频本身访问不到（被设成仅UP主可见、已下架之类）。
+  // 这时候**查不到 ≠ 评论没了**，所以单独归一类，不能混进"未检查"里让人看不出原因。
+  if (json.code === -404) {
+    return {
+      alive: null, unreachable: true, code: -404,
+      message: '视频/评论区访问不到（' + (json.message || '啥都木有') + '），没法确认这条还在不在'
+    };
+  }
   if (json.code !== 0) {
     return { alive: null, code: json.code, message: json.message || '' };
   }
@@ -1781,36 +1829,125 @@ async function fetchVideoInfo(v) {
  * 根评论、照样返回 code 0 —— 光看 code 会把已删的楼中楼误判成还在。
  * 所以这种情况必须再去那条会话的回复列表里把**它本人**找出来，找到才算活着。
  */
-async function checkAliveOne(item) {
-  const first = await fetchReplyRaw({ type: item.type, oid: item.oid, root: item.rpid, pn: 1, ps: 1 });
+/** B 站把楼中楼每页硬限制在 20 条 —— 写 ps=49 它也只给 20，别被这个骗了 */
+const THREAD_PAGE_SIZE = 20;
+
+/** 取会话的一页；返回 { list, count } 或 { error } */
+async function fetchThreadPage(item, rootId, pn) {
+  const r = await fetchReplyRaw({
+    type: item.type, oid: item.oid, root: rootId, pn: pn, ps: THREAD_PAGE_SIZE
+  });
+  if (r.error) return { error: r.error };
+
+  const j = r.json;
+  if (!j || j.code !== 0) {
+    return { error: (j && j.message) || '会话没返回数据', code: j && j.code };
+  }
+  return {
+    list: (j.data && j.data.replies) || [],
+    count: (j.data && j.data.page && j.data.page.count) || 0
+  };
+}
+
+/**
+ * 在一条会话里找出"本人"。
+ *
+ * 会话列表**按时间升序**（实测过），而我们手上有这条评论的 ctime ——
+ * 所以不需要一页页翻，**按时间二分定位到具体哪一页**就行：
+ * 一千条的会话也只要约 6 次请求，而不是 50 次。
+ *
+ * 以前这里写 `ps=49` 并且用 `pn*49 >= count` 判断"翻完了"，是错的 ——
+ * B 站默默只给 20 条，所以实际只翻了 60 条就以为翻完了整条会话，
+ * 长会话里的楼中楼于是全被误判成"未检查"。
+ */
+async function findInThread(item, rootId) {
+  const first = await fetchThreadPage(item, rootId, 1);
   if (first.error) return { alive: null, message: first.error };
 
+  const has = list => list.some(x => String(x.rpid) === String(item.rpid));
+  const pages = Math.max(1, Math.ceil(first.count / THREAD_PAGE_SIZE));
+
+  if (has(first.list)) return { alive: true, message: '' };
+  if (pages === 1) {
+    return { alive: false, message: '整条会话只有这一页，里面没有它' };
+  }
+
+  const target = Number(item.ctime) || 0;
+  if (!target) {
+    return { alive: null, message: '这条没有时间，没法在长会话里定位它' };
+  }
+
+  const seen = { 1: first };
+  const take = async pn => {
+    if (seen[pn]) return seen[pn];
+    const r = await fetchThreadPage(item, rootId, pn);
+    if (!r.error) seen[pn] = r;
+    return r;
+  };
+
+  let lo = 1, hi = pages, landed = null;
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    const page = await take(mid);
+    if (page.error) return { alive: null, message: page.error };
+    if (has(page.list)) return { alive: true, message: '' };
+
+    const times = page.list.map(x => Number(x.ctime) || 0).filter(Boolean);
+    if (!times.length) break;
+
+    const t0 = times[0], t1 = times[times.length - 1];
+    if (target < t0) hi = mid - 1;
+    else if (target > t1) lo = mid + 1;
+    else { landed = mid; break; }
+  }
+
+  // 时间正好落在两页之间（比如这条已经被删、时间戳留下了空档），
+  // 就用二分收敛出的插入位置当落点，再看一眼左右邻居。
+  if (landed === null) {
+    landed = Math.min(Math.max(lo, 1), pages);
+    for (const pn of [landed - 1, landed]) {
+      if (pn < 1 || pn > pages) continue;
+      const page = await take(pn);
+      if (page.error) return { alive: null, message: page.error };
+      if (has(page.list)) return { alive: true, message: '' };
+    }
+    return { alive: null, message: '按时间没能定位到它（时间可能有偏差），没敢下结论' };
+  }
+
+  for (const pn of [landed - 1, landed + 1]) {
+    if (pn < 1 || pn > pages) continue;
+    const page = await take(pn);
+    if (page.error) return { alive: null, message: page.error };
+    if (has(page.list)) return { alive: true, message: '' };
+  }
+
+  return { alive: false, message: '会话里已经没有它了（按时间定位到第 ' + landed + ' 页，那一带没有）' };
+}
+
+/**
+ * 判断一条评论还在不在。
+ * 返回 { state, alive, message }：state 是四态里的一种（含查不到），alive 是给老调用方的兼容字段。
+ */
+async function checkAliveOne(item) {
+  const done = a => ({
+    state: a.unreachable ? 'unreachable'
+      : a.alive === true ? 'live'
+        : a.alive === false ? 'gone' : 'unknown',
+    alive: a.alive === undefined ? null : a.alive,
+    message: a.message || ''
+  });
+
+  const first = await fetchReplyRaw({ type: item.type, oid: item.oid, root: item.rpid, pn: 1, ps: 1 });
+  if (first.error) return done({ alive: null, message: first.error });
+
   const a = interpretReplyCheck(first.json);
-  if (a.alive !== true) return { alive: a.alive, code: a.code, message: a.message };
+  if (a.alive !== true) return done(a);
 
   // 一级评论：B 站返回的 root 就是它自己
-  if (a.rootRpid === String(item.rpid)) return { alive: true, code: 0, message: '' };
+  if (a.rootRpid === String(item.rpid)) return done({ alive: true, message: '' });
 
-  // 楼中楼：去所属会话里把它本人找出来
-  const rootId = a.rootRpid;
-  for (let pn = 1; pn <= 3; pn++) {
-    const r = await fetchReplyRaw({ type: item.type, oid: item.oid, root: rootId, pn: pn, ps: 49 });
-    if (r.error) return { alive: null, message: r.error };
-
-    const j = r.json;
-    if (j.code !== 0) return { alive: null, code: j.code, message: j.message || '' };
-
-    const list = (j.data && j.data.replies) || [];
-    for (let i = 0; i < list.length; i++) {
-      if (String(list[i].rpid) === String(item.rpid)) return { alive: true, code: 0, message: '' };
-    }
-
-    const count = (j.data && j.data.page && j.data.page.count) || 0;
-    if (pn * 49 >= count) {
-      return { alive: false, code: 0, message: '会话里已经没有这条了' };
-    }
-  }
-  return { alive: null, code: 0, message: '这条会话太长，没能确认' };
+  // 楼中楼：B 站把我们解析到了所属的根评论，得去会话里把本人找出来
+  return done(await findInThread(item, a.rootRpid));
 }
 
 /**
