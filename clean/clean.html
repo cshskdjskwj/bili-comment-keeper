@@ -11,133 +11,153 @@
     <span class="logo">🗂️</span>
     <h1>评论管家</h1>
     <span class="spacer"></span>
+    <!-- 导入历史只是一次性的初始化步骤，塞进主页会喧宾夺主，所以收进一角 -->
+    <button id="btn-open-import" class="btn mini ghost" title="首次使用：把以前发过的评论抓进来">导入历史</button>
     <button id="btn-settings" class="btn mini ghost" title="打开设置">设置</button>
   </header>
 
-  <!-- 库概览：产品重心是"我有哪些评论"，所以这里显示的是库的状态 -->
-  <section class="overview">
-    <div class="metrics">
-      <span class="metric"><b id="lib-total">0</b><i>库里</i></span>
-      <span class="metric ok"><b id="lib-live">0</b><i>还在</i></span>
-      <span class="metric mute"><b id="lib-gone">0</b><i>已没了</i></span>
-      <span class="metric bad"><b id="lib-deleted">0</b><i>已删除</i></span>
-      <span class="metric warn"><b id="lib-unknown">0</b><i>未检查</i></span>
-    </div>
-    <div class="eta" id="lib-updated"></div>
-  </section>
+  <!-- ================================================== 主视图：评论库 -->
+  <div id="view-main" class="view">
 
-  <!-- 搜索 / 排序 -->
-  <section class="toolbar">
-    <input id="lib-q" type="search" class="inp grow" placeholder="搜索正文 / rpid / 视频号" autocomplete="off">
-    <select id="lib-sort" class="inp" title="排序方式">
-      <option value="time-desc">时间 新→旧</option>
-      <option value="time-asc">时间 旧→新</option>
-      <option value="video">按视频</option>
-    </select>
-  </section>
-
-  <!-- 状态筛选 -->
-  <nav class="filters" id="lib-states"></nav>
-
-  <!-- 库操作 -->
-  <section class="actions">
-    <button id="btn-aicu-probe" class="btn primary">巡检存活</button>
-    <button id="btn-aicu-autostop" class="btn danger hide">停止</button>
-    <button id="btn-delete-selected" class="btn">删除选中</button>
-    <button id="btn-titles" class="btn ghost">拉视频标题</button>
-    <button id="btn-aicu-bookmark" class="btn ghost">存入收藏夹</button>
-  </section>
-
-  <section class="actions">
-    <button id="btn-export-json" class="btn mini">导出 JSON</button>
-    <button id="btn-export-html" class="btn mini">导出 HTML</button>
-    <button id="btn-export-md" class="btn mini">导出 Markdown</button>
-    <button id="btn-import-json" class="btn mini ghost">导入备份</button>
-    <input type="file" id="file-import" accept=".json,application/json" class="hide">
-  </section>
-
-  <div id="hint" class="hint">这里是你的<b>评论库</b>：本地保存所有抓到的评论，可以搜索、筛选、导出备份。删除只是库里其中一个可选操作。</div>
-
-  <!-- 库列表 -->
-  <section class="list-wrap">
-    <div class="list-hd">
-      <span id="lib-count">还没有记录</span>
-      <span class="spacer"></span>
-      <label class="mini-check"><input type="checkbox" id="check-page"> 全选本页</label>
-    </div>
-    <div id="list" class="list"></div>
-    <div class="pager" id="lib-pager"></div>
-  </section>
-
-  <!-- 从 aicu.cc 抓取：默认收起 -->
-  <details class="fold" id="fold-aicu">
-    <summary>从 aicu.cc 抓取更多评论 · <b id="aicu-count">0</b> 条</summary>
-    <div class="fold-body">
-      <div class="arc-path" id="aicu-uid"></div>
-      <div id="aicu-hint" class="hint"></div>
-      <div class="row-actions">
-        <button id="btn-aicu-auto" class="btn mini">自动翻页抓取</button>
-        <button id="btn-aicu-read" class="btn mini">读当前页</button>
-        <button id="btn-aicu-prune" class="btn mini">清掉没了的</button>
-        <button id="btn-aicu-clear" class="btn mini ghost">清空导入</button>
-      </div>
-      <div id="aicu-list" class="arc-list"></div>
-    </div>
-  </details>
-
-  <!-- 删除执行区：降级成一个普通折叠区，不再是主界面 -->
-  <details class="fold" id="fold-delete">
-    <summary>删除执行 · 队列里 <b id="sel-count">0</b> 条</summary>
-    <div class="fold-body">
+    <section class="overview">
       <div class="metrics">
-        <span class="metric"><b id="stat-pending">0</b><i>待处理</i></span>
-        <span class="metric ok"><b id="stat-ok">0</b><i>已删除</i></span>
-        <span class="metric bad"><b id="stat-fail">0</b><i>失败</i></span>
-        <span class="metric mute"><b id="stat-gone">0</b><i>早就没了</i></span>
+        <span class="metric"><b id="lib-total">0</b><i>库里</i></span>
+        <span class="metric ok"><b id="lib-live">0</b><i>还在</i></span>
+        <span class="metric mute"><b id="lib-gone">0</b><i>已没了</i></span>
+        <span class="metric bad"><b id="lib-deleted">0</b><i>已删除</i></span>
+        <span class="metric warn"><b id="lib-unknown">0</b><i>未检查</i></span>
       </div>
-      <div class="progress"><i id="progress-inner"></i></div>
-      <div class="eta" id="eta"></div>
-      <div class="row-actions">
-        <button id="btn-start" class="btn primary">开始删除</button>
-        <button id="btn-stop" class="btn danger" disabled>停止</button>
-        <button id="btn-retry" class="btn ghost">重试失败</button>
-        <button id="btn-reload" class="btn ghost">刷新队列</button>
-        <button id="btn-aicu-merge" class="btn ghost">把库里的全部加入队列</button>
-      </div>
-      <nav class="filters" id="filters"></nav>
+      <div class="eta" id="lib-updated"></div>
+    </section>
+
+    <section class="toolbar">
+      <input id="lib-q" type="search" class="inp grow" placeholder="搜索正文 / rpid / 视频号" autocomplete="off">
+      <select id="lib-sort" class="inp" title="排序方式">
+        <option value="time-desc">时间 新→旧</option>
+        <option value="time-asc">时间 旧→新</option>
+        <option value="video">按视频</option>
+      </select>
+    </section>
+
+    <nav class="filters" id="lib-states"></nav>
+
+    <section class="actions">
+      <button id="btn-aicu-probe" class="btn primary">巡检存活</button>
+      <button id="btn-aicu-autostop" class="btn danger hide">停止</button>
+      <button id="btn-delete-selected" class="btn">删除选中</button>
+      <button id="btn-titles" class="btn ghost">拉视频标题</button>
+      <button id="btn-aicu-bookmark" class="btn ghost">存入收藏夹</button>
+    </section>
+
+    <section class="actions">
+      <button id="btn-export-json" class="btn mini">导出 JSON</button>
+      <button id="btn-export-html" class="btn mini">导出 HTML</button>
+      <button id="btn-export-md" class="btn mini">导出 Markdown</button>
+      <button id="btn-import-json" class="btn mini ghost">导入备份</button>
+      <input type="file" id="file-import" accept=".json,application/json" class="hide">
+    </section>
+
+    <div id="hint" class="hint">这里是你的<b>评论库</b>：本地保存所有抓到的评论，可以搜索、筛选、导出备份。删除只是库里其中一个可选操作。</div>
+
+    <section class="list-wrap">
       <div class="list-hd">
-        <span>删除队列</span>
+        <span id="lib-count">还没有记录</span>
         <span class="spacer"></span>
-        <label class="mini-check"><input type="checkbox" id="check-all" checked> 全选</label>
+        <label class="mini-check"><input type="checkbox" id="check-page"> 全选本页</label>
       </div>
-      <div id="queue-list" class="list"></div>
-    </div>
-  </details>
+      <div id="list" class="list"></div>
+      <div class="pager" id="lib-pager"></div>
+    </section>
 
-  <!-- 已删除记录：它只是"账本" -->
-  <details class="fold" id="fold-archive">
-    <summary>已删除记录（本地书签账本） · <b id="arc-count">0</b> 条</summary>
-    <div class="fold-body">
-      <div class="arc-path" id="arc-path"></div>
-      <div class="row-actions">
-        <span id="purge-confirm" class="purge-confirm hide">
-          清空后无法恢复
-          <button id="btn-purge-yes" class="btn mini danger">确定清空</button>
-          <button id="btn-purge-no" class="btn mini ghost">取消</button>
-        </span>
-        <button id="btn-purge" class="btn mini ghost">清空本地记录</button>
+    <!-- 删除执行区：一个可选操作，折叠起来 -->
+    <details class="fold" id="fold-delete">
+      <summary>删除执行 · 队列里 <b id="sel-count">0</b> 条</summary>
+      <div class="fold-body">
+        <div class="metrics">
+          <span class="metric"><b id="stat-pending">0</b><i>待处理</i></span>
+          <span class="metric ok"><b id="stat-ok">0</b><i>已删除</i></span>
+          <span class="metric bad"><b id="stat-fail">0</b><i>失败</i></span>
+          <span class="metric mute"><b id="stat-gone">0</b><i>早就没了</i></span>
+        </div>
+        <div class="progress"><i id="progress-inner"></i></div>
+        <div class="eta" id="eta"></div>
+        <div class="row-actions">
+          <button id="btn-start" class="btn primary">开始删除</button>
+          <button id="btn-stop" class="btn danger" disabled>停止</button>
+          <button id="btn-retry" class="btn ghost">重试失败</button>
+          <button id="btn-reload" class="btn ghost">刷新队列</button>
+          <button id="btn-aicu-merge" class="btn ghost">把库里的全部加入队列</button>
+        </div>
+        <nav class="filters" id="filters"></nav>
+        <div class="list-hd">
+          <span>删除队列</span>
+          <span class="spacer"></span>
+          <label class="mini-check"><input type="checkbox" id="check-all" checked> 全选</label>
+        </div>
+        <div id="queue-list" class="list"></div>
       </div>
-      <div id="arc-list" class="arc-list"></div>
-    </div>
-  </details>
+    </details>
 
-  <!-- 日志：出错时自动展开 -->
-  <details class="fold" id="fold-log">
-    <summary>运行日志</summary>
-    <div class="fold-body">
-      <pre id="log"></pre>
+    <!-- 已删除记录：它只是"账本" -->
+    <details class="fold" id="fold-archive">
+      <summary>已删除记录（本地书签账本） · <b id="arc-count">0</b> 条</summary>
+      <div class="fold-body">
+        <div class="arc-path" id="arc-path"></div>
+        <div class="row-actions">
+          <span id="purge-confirm" class="purge-confirm hide">
+            清空后无法恢复
+            <button id="btn-purge-yes" class="btn mini danger">确定清空</button>
+            <button id="btn-purge-no" class="btn mini ghost">取消</button>
+          </span>
+          <button id="btn-purge" class="btn mini ghost">清空本地记录</button>
+        </div>
+        <div id="arc-list" class="arc-list"></div>
+      </div>
+    </details>
+
+    <!-- 日志：出错时自动展开 -->
+    <details class="fold" id="fold-log">
+      <summary>运行日志</summary>
+      <div class="fold-body">
+        <pre id="log"></pre>
+      </div>
+    </details>
+  </div>
+
+  <!-- ========================================== 副视图：导入历史（初始化） -->
+  <div id="view-import" class="view hide">
+    <div class="topbar">
+      <button id="btn-back-main" class="btn mini ghost">← 返回评论库</button>
+      <span class="spacer"></span>
+      <b class="view-title">导入历史评论</b>
     </div>
-  </details>
+
+    <div class="hint">
+      这是<b>首次使用时的初始化步骤</b>，不是日常功能 —— 日常用上面的评论库就够了。<br>
+      扩展只能自动记录<b>装上之后</b>发的评论；装上之前发的、在手机上发的，靠这里补。
+      抓进来的评论会直接进评论库，之后可以搜索、筛选、导出。
+    </div>
+
+    <div class="arc-path" id="aicu-uid"></div>
+    <div id="aicu-hint" class="hint"></div>
+
+    <div class="row-actions">
+      <button id="btn-aicu-auto" class="btn mini">自动翻页抓取</button>
+      <button id="btn-aicu-read" class="btn mini">读当前页</button>
+      <button id="btn-aicu-prune" class="btn mini">清掉没了的</button>
+      <button id="btn-aicu-clear" class="btn mini ghost">清空导入</button>
+    </div>
+
+    <div class="arc-path">已抓进库：<b id="aicu-count">0</b> 条</div>
+
+    <div class="hint">
+      用法：在浏览器里打开你自己的 aicu 页面
+      （<code>https://www.aicu.cc/reply?uid=你的UID</code>），再点上面的「自动翻页抓取」，
+      扩展会替你翻页并把评论读进库里。抓完点「← 返回评论库」。
+    </div>
+
+    <div id="aicu-list" class="arc-list"></div>
+  </div>
 
   <script type="module" src="clean.js"></script>
 </body>

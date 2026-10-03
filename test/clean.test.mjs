@@ -47,12 +47,24 @@ const SRC = RAW
 assert.ok(!/^\s*import\s/m.test(SRC), 'import 应该已经被剥掉');
 assert.ok(!/^init\(\)/m.test(SRC), '末尾的 init() 应该已经被剥掉');
 
-/** 一个够用的假 DOM 元素 */
+/** 一个够用的假 DOM 元素。classList 是真的能用 —— 视图切换就靠它。 */
 function fakeEl() {
+  const classes = new Set();
   return {
     textContent: '', className: '', innerHTML: '', disabled: false, checked: true,
+    indeterminate: false,
     open: false, style: {}, dataset: {},
-    classList: { toggle() {}, add() {}, remove() {}, contains() { return false; } },
+    classList: {
+      add(c) { classes.add(c); },
+      remove(c) { classes.delete(c); },
+      contains(c) { return classes.has(c); },
+      toggle(c, on) {
+        const want = on === undefined ? !classes.has(c) : !!on;
+        if (want) classes.add(c); else classes.delete(c);
+        return want;
+      },
+      _set() { return classes; }
+    },
     addEventListener() {}, querySelector() { return null; }, querySelectorAll() { return []; },
     closest() { return null; }
   };
@@ -66,12 +78,25 @@ const fakeDoc = {
   querySelectorAll() { return []; }
 };
 
-/** 建一个沙箱；injectHook 决定「注入删除脚本」这一步的行为 */
-async function makeSandbox(injectHook) {
+/**
+ * 建一个沙箱；injectHook 决定「注入删除脚本」这一步的行为。
+ * opts.seed 可以预置 chrome.storage.local 的内容（用来铺一份评论库）。
+ */
+async function makeSandbox(injectHook, opts) {
   const shared = await import('../src/shared.js');
   const pageStore = {};          // 模拟页面上的 window.__bcDelResults
   const posts = [];              // 模拟页面发出的 postMessage
   const worlds = [];             // 记录每次注入用的世界（MAIN / ISOLATED）
+
+  const localData = new Map();
+  const seed = (opts && opts.seed) || {};
+  for (const k of Object.keys(seed)) localData.set(k, seed[k]);
+
+  // 每个沙箱用自己的元素表，免得用例之间互相串
+  const ownEls = new Map();
+  const doc = Object.assign({}, fakeDoc, {
+    getElementById(id) { if (!ownEls.has(id)) ownEls.set(id, fakeEl()); return ownEls.get(id); }
+  });
 
   const chromeStub = {
     runtime: {
@@ -80,7 +105,20 @@ async function makeSandbox(injectHook) {
       getManifest: () => ({ version: '1.2.0' }),
       openOptionsPage() {}
     },
-    storage: { local: { async get() { return {}; }, async set() {}, async remove() {} } },
+    storage: {
+      local: {
+        async get(keys) {
+          const out = {};
+          const list = Array.isArray(keys) ? keys : (typeof keys === 'string' ? [keys] : Object.keys(keys || {}));
+          for (const k of list) if (localData.has(k)) out[k] = localData.get(k);
+          return out;
+        },
+        async set(obj) { for (const k of Object.keys(obj)) localData.set(k, obj[k]); },
+        async remove(keys) {
+          for (const k of (Array.isArray(keys) ? keys : [keys])) localData.delete(k);
+        }
+      }
+    },
     bookmarks: {
       getChildren: async () => [], get: async () => null, search: async () => [],
       create: async () => ({ id: 'x' }), move: async () => {}, remove: async () => {}, removeTree: async () => {}
@@ -104,9 +142,14 @@ async function makeSandbox(injectHook) {
     }
   };
 
+  // shared.js 里那些函数是 **Node 里的真实模块**，它们读的是 Node 全局的 chrome，
+  // 不是 vm 沙箱里的那个。所以得把桩同时挂到全局上，否则会报 "chrome is not defined"。
+  // 用例是顺序 await 的，每个 makeSandbox 覆盖一次不会互相干扰。
+  globalThis.chrome = chromeStub;
+
   const sandbox = Object.assign({}, shared, {
     chrome: chromeStub,
-    document: fakeDoc,
+    document: doc,
     console, setTimeout, clearTimeout, clearInterval,
     URL, URLSearchParams, AbortController, Promise,
     JSON, Math, Date, Number, String, Array, Object, RegExp, isFinite, Error
@@ -138,7 +181,7 @@ async function makeSandbox(injectHook) {
   vm.createContext(sandbox);
   vm.runInContext(SRC, sandbox, { filename: 'clean.js' });
 
-  return { sandbox, pageStore, posts, worlds };
+  return { sandbox, pageStore, posts, worlds, localData, els: ownEls };
 }
 
 console.log('\n删除链路（clean.js）回归测试\n');
@@ -566,6 +609,117 @@ await test('状态筛选栏：计数和选中态', async () => {
   assert.match(el.innerHTML, /还在 <b>17<\/b>/);
   assert.match(el.innerHTML, /已没了 <b>81<\/b>/);
   assert.equal((el.innerHTML.match(/chip on/g) || []).length, 1, '「全部」应该处于选中态');
+});
+
+console.log('\n— 删除队列的准入规则 —');
+
+/** 铺一份评论库到假 storage 里 */
+function seedLibrary(items) {
+  const map = {};
+  for (const it of items) map[it.rpid] = it;
+  return { bc_library: { v: 2, uid: 'u', total: items.length, items: map, videos: {} } };
+}
+
+const libItem = (rpid, state, extra) => Object.assign({
+  rpid: rpid, type: 1, oid: '555', root: '0', rank: 1,
+  message: '评论 ' + rpid, ctime: 1700000000, state: state
+}, extra || {});
+
+await test('「删除选中」不会把"已经没了"的放进队列（用户反馈的线上 bug）', async () => {
+  const { sandbox, els } = await makeSandbox(async () => [{ result: undefined }], {
+    seed: seedLibrary([
+      libItem('1', 'live'),
+      libItem('2', 'gone'),
+      libItem('3', 'deleted'),
+      libItem('4', 'unknown')
+    ])
+  });
+
+  for (const r of ['1', '2', '3', '4']) sandbox.libSelected.add(r);
+  await sandbox.deleteSelected();
+
+  const queue = els.get('queue-list').innerHTML;
+  assert.ok(queue.indexOf('data-id="aicu:1"') >= 0, '还在的应该进队列');
+  assert.ok(queue.indexOf('data-id="aicu:4"') >= 0, '没查过的也该进 —— 删一次正好当探测');
+  assert.ok(queue.indexOf('data-id="aicu:2"') < 0, '已经没了的绝不能进队列');
+  assert.ok(queue.indexOf('data-id="aicu:3"') < 0, '之前删过的也不能进队列');
+
+  const hint = els.get('hint').textContent;
+  assert.match(hint, /去掉|跳过/, `要说清哪些被去掉了，实际提示：${hint}`);
+});
+
+await test('「删除选中」全选成"没了的"时不建队列，而是说清原因', async () => {
+  const { sandbox, els } = await makeSandbox(async () => [{ result: undefined }], {
+    seed: seedLibrary([libItem('2', 'gone'), libItem('3', 'gone')])
+  });
+
+  sandbox.libSelected.add('2');
+  sandbox.libSelected.add('3');
+  await sandbox.deleteSelected();
+
+  const queueEl = els.get('queue-list');
+  assert.equal((queueEl && queueEl.innerHTML) || '', '',
+    '队列里不该有任何东西 —— 全被挡下时连队列都不该重建');
+
+  const hint = els.get('hint').textContent;
+  assert.match(hint, /不能进删除队列/);
+  assert.match(hint, /2 条已经没了/, `要报出具体条数，实际：${hint}`);
+  assert.equal(sandbox.libSelected.size, 0, '被挡下的要从勾选里摘掉，免得反复撞');
+});
+
+await test('「把库里的全部加入队列」也挡住 gone 和 deleted', async () => {
+  const { sandbox, els } = await makeSandbox(async () => [{ result: undefined }], {
+    seed: seedLibrary([
+      libItem('1', 'live'),
+      libItem('2', 'gone'),
+      libItem('3', 'deleted'),
+      libItem('4', 'unknown')
+    ])
+  });
+
+  await sandbox.mergeAicu();
+
+  const queue = els.get('queue-list').innerHTML;
+  assert.ok(queue.indexOf('data-id="aicu:1"') >= 0);
+  assert.ok(queue.indexOf('data-id="aicu:4"') >= 0);
+  assert.ok(queue.indexOf('data-id="aicu:2"') < 0, '已经没了的不能进');
+  assert.ok(queue.indexOf('data-id="aicu:3"') < 0,
+    'deleted 尤其不能漏 —— 老的 alive 字段对它算 undefined，只查 alive 会漏网');
+
+  const hint = els.get('aicu-hint').textContent;
+  assert.match(hint, /1 条探测过、确认已经没了/);
+  assert.match(hint, /1 条是之前删过的/);
+});
+
+console.log('\n— 主视图 / 副视图（导入历史是初始化步骤，不是日常功能） —');
+
+await test('默认在库视图：导入视图是藏着的', async () => {
+  const { sandbox, els } = await makeSandbox(async () => [{ result: undefined }]);
+
+  sandbox.showView('main');
+  assert.equal(els.get('view-main').classList.contains('hide'), false, '库视图要显示');
+  assert.equal(els.get('view-import').classList.contains('hide'), true, '导入视图要藏着');
+});
+
+await test('点进导入视图后，库视图让位', async () => {
+  const { sandbox, els } = await makeSandbox(async () => [{ result: undefined }]);
+
+  sandbox.showView('import');
+  assert.equal(els.get('view-main').classList.contains('hide'), true);
+  assert.equal(els.get('view-import').classList.contains('hide'), false);
+
+  sandbox.showView('main');
+  assert.equal(els.get('view-main').classList.contains('hide'), false);
+  assert.equal(els.get('view-import').classList.contains('hide'), true, '回来之后导入视图要收起来');
+});
+
+await test('两个视图的容器都只靠 hide 类切换，没有任何一个被移除', async () => {
+  const { sandbox, els } = await makeSandbox(async () => [{ result: undefined }]);
+  // 切来切去之后两个容器都还在（不是被删掉再插回来）
+  sandbox.showView('import');
+  sandbox.showView('main');
+  sandbox.showView('import');
+  assert.ok(els.get('view-main') && els.get('view-import'));
 });
 
 /* ---------------------------------------------------------------- 汇总 */

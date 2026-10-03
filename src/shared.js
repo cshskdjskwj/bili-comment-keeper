@@ -643,6 +643,21 @@ export function aliveFromState(state) {
   return undefined;
 }
 
+/**
+ * 这条评论还值得为它发一次删除请求吗？
+ *
+ *   live    值得 —— 确认还在
+ *   unknown 值得 —— 还没查过，删一次正好当探测
+ *   gone    **不值得** —— 已经没了，再问一次只会拿到 12022
+ *   deleted **不值得** —— 我们自己已经删过了
+ *
+ * 这是 v1.3 做存活探测的初衷：别为早就没了的评论浪费请求。
+ * 所以任何"进删除队列"的入口都必须过这一关。
+ */
+export function isDeletable(state) {
+  return state === 'live' || state === 'unknown';
+}
+
 /** 规整库里的一条记录；缺 rpid / type / oid 就返回 null */
 export function normalizeLibItem(raw) {
   const base = normalizeAicuItem(raw);

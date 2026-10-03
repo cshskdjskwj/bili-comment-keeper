@@ -419,6 +419,16 @@ await test('导出 Markdown：正文里的换行不会把结构撑坏', async ()
   assert.ok(bodyLines[0].startsWith('> '), '多行正文要走引用块，不能裸着插进来');
 });
 
+await test('准入规则：只有 live / unknown 值得为它发一次删除请求', async () => {
+  const { isDeletable } = shared;
+  assert.equal(isDeletable('live'), true, '确认还在 —— 该删');
+  assert.equal(isDeletable('unknown'), true, '还没查过 —— 删一次正好当探测');
+  assert.equal(isDeletable('gone'), false, '已经没了 —— 再问只会拿到 12022，白费一次请求');
+  assert.equal(isDeletable('deleted'), false, '我们自己删过了 —— 同理');
+  assert.equal(isDeletable(undefined), false, '状态不明的一律不放行');
+  assert.equal(isDeletable('乱七八糟'), false);
+});
+
 /* ---------------------------------------------------------------- 汇总 */
 
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项\n`);

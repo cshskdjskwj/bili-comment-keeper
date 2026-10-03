@@ -12,6 +12,7 @@ import {
   getAicuStore, listAicuItems, clearAicuStore, removeAicuItems, markAicuAlive,
   aicuPageUrl, aicuTypeName, aicuCommentUrl, aicuSubUrl,
   libraryStats, queryLib, getLibItems, missingVideoTitles, saveVideoTitles, videoKey,
+  isDeletable,
   exportLibraryJSON, exportLibraryHTML, exportLibraryMarkdown, importLibraryJSON
 } from '../src/shared.js';
 
@@ -158,7 +159,6 @@ let indexCache = {}, items = [], stats = { ok: 0, fail: 0, gone: 0 }, purgeTimer
 let indexRefreshDone = false;   // 本轮删除里是否已经重读过索引
 let sourceFilter = 'all';       // 来源筛选：all | bookmark | aicu
 let logAutoOpened = false;      // 出错后日志是否已经自动展开过
-let aicuFoldAutoOpened = false; // aicu 折叠区是否已经自动展开过
 
 chrome.runtime.onMessage.addListener(function (msg) {
   if (!msg) return;
@@ -227,6 +227,10 @@ function bindEvents() {
   $('btn-settings').addEventListener('click', function () {
     chrome.runtime.openOptionsPage();
   });
+
+  // 主视图 ⇄ 导入视图
+  $('btn-open-import').addEventListener('click', function () { showView('import'); });
+  $('btn-back-main').addEventListener('click', function () { showView('main'); });
 
   // 来源筛选
   $('filters').addEventListener('click', function (e) {
@@ -417,12 +421,6 @@ async function loadAicu() {
 
   $('aicu-count').textContent = String(list.length);
 
-  // 第一次看到有待导入的条目时自动展开；之后尊重用户的手动开合
-  if (!aicuFoldAutoOpened && list.length) {
-    aicuFoldAutoOpened = true;
-    const fold = $('fold-aicu');
-    if (fold) fold.open = true;
-  }
   $('aicu-uid').textContent = store.uid
     ? ('UID ' + store.uid + (store.total ? ' · 站上记着 ' + store.total + ' 条' : ''))
     : '';
@@ -489,14 +487,17 @@ async function mergeAicu() {
   for (const i of items) if (i.parsed && i.parsed.rpid) known.add(i.parsed.rpid);
 
   const archived = await archivedRpids();
-  let added = 0, skipped = 0, alreadyGone = 0, probedGone = 0, untested = 0;
+  let added = 0, skipped = 0, alreadyGone = 0, probedGone = 0, probedDeleted = 0, untested = 0;
 
   for (const item of list) {
     if (known.has(item.rpid)) { skipped++; continue; }
-    // 探测过、确认 B 站上已经没有了的，不再放进来 —— 这正是探测的意义
-    if (item.alive === false) { probedGone++; continue; }
+    // 已经没了的 / 我们自己删过的，都不该再进队列 —— 为它们发请求只会白拿一个 12022。
+    // 这里必须看 state 而不是老的 alive：alive 对 deleted 是 undefined，会漏网。
+    if (item.state === 'gone') { probedGone++; continue; }
+    if (item.state === 'deleted') { probedDeleted++; continue; }
+    if (!isDeletable(item.state)) { probedGone++; continue; }
     if (archived.has(item.rpid)) { alreadyGone++; continue; }
-    if (item.alive === undefined) untested++;
+    if (item.state === 'unknown') untested++;
     items.push(aicuRow(item));
     known.add(item.rpid);
     added++;
@@ -506,11 +507,12 @@ async function mergeAicu() {
   const parts = [];
   if (skipped) parts.push(`${skipped} 条已在列表里`);
   if (probedGone) parts.push(`${probedGone} 条探测过、确认已经没了，跳过`);
+  if (probedDeleted) parts.push(`${probedDeleted} 条是之前删过的，跳过`);
   if (alreadyGone) parts.push(`${alreadyGone} 条已在「已删除记录」里，跳过`);
   const tail = parts.length ? `（${parts.join('，')}）` : '';
   const warn = untested ? `　注意：其中 ${untested} 条还没探测过存活，` +
-    '想先筛掉已经删掉的，点「探测存活」。' : '';
-  setAicuHint(`已加入 ${added} 条${tail}。${warn}勾选后点上面的「删除评论」即可。`, added ? '' : 'warn');
+    '想先筛掉已经删掉的，点「巡检存活」。' : '';
+  setAicuHint(`已加入 ${added} 条${tail}。${warn}后点「开始删除」即可。`, added ? '' : 'warn');
   await loadAicu();
 }
 
@@ -1019,7 +1021,13 @@ let libPage = 0;
 let libTimer = null;
 
 const LIB_PAGE_SIZE = 50;
-const libSelected = new Set();   // 勾选的 rpid
+
+/**
+ * 库里勾选的 rpid。
+ * 用 `var` 是故意的：它会挂到全局对象上，测试里能直接摆布它来验证
+ * 「哪些状态允许进删除队列」—— 这个准入规则出过一次线上 bug。
+ */
+var libSelected = new Set();
 
 const LIB_STATE_TAG = {
   live: '<i class="tag live">还在</i>',
@@ -1151,7 +1159,11 @@ async function refreshLibrary() {
 
 /**
  * 把库里勾选的评论放进删除队列。
- * 注意是"放进队列"而不是立刻删 —— 删除不可逆，先让人看一眼队列。
+ *
+ * **已经没了的（gone）和我们自己删过的（deleted）进不来** —— 为它们发删除请求
+ * 只会拿到 12022，纯属浪费一次接口调用，也正好把存活探测省下的功夫还回去。
+ *
+ * 而且是"放进队列"而不是立刻删：删除不可逆，先让人看一眼队列。
  */
 async function deleteSelected() {
   if (running) return;
@@ -1160,11 +1172,30 @@ async function deleteSelected() {
   const picked = await getLibItems(Array.from(libSelected));
   if (!picked.length) { setHint('勾选的条目在库里找不到了，刷新一下再看看。', 'bad'); return; }
 
+  const deletable = picked.filter(it => isDeletable(it.state));
+  const blocked = picked.filter(it => !isDeletable(it.state));
+
+  // 被挡下的一律从勾选集里摘掉，免得反复撞同一堵墙
+  for (const it of blocked) libSelected.delete(it.rpid);
+
+  if (!deletable.length) {
+    const nGone = blocked.filter(x => x.state === 'gone').length;
+    const nDel = blocked.filter(x => x.state === 'deleted').length;
+    const why = [];
+    if (nGone) why.push(`${nGone} 条已经没了`);
+    if (nDel) why.push(`${nDel} 条是之前删过的`);
+    await refreshLibrary();
+    setHint(`选中的 ${picked.length} 条都不能进删除队列：${why.join('，')}。` +
+      '已经不存在的评论不需要（也没法）再删一次 —— 为它们发请求只会白费一次接口调用。',
+      'warn');
+    return;
+  }
+
   const have = new Set();
   for (const x of items) if (x.parsed && x.parsed.rpid) have.add(x.parsed.rpid);
 
   let added = 0;
-  for (const it of picked) {
+  for (const it of deletable) {
     if (have.has(it.rpid)) continue;
     items.push(aicuRow(it));
     have.add(it.rpid);
@@ -1173,10 +1204,12 @@ async function deleteSelected() {
 
   render();
   $('fold-delete').open = true;
-  libSelected.clear();
   await refreshLibrary();
 
-  setHint(`已把 ${added} 条放进删除队列（重复的自动跳过）。` +
+  const skip = blocked.length
+    ? `　另有 ${blocked.length} 条已从勾选里去掉（已经没了或删过的，不该再删一次）。`
+    : '';
+  setHint(`已把 ${added} 条放进删除队列（重复的自动跳过）。${skip}` +
     '展开「删除执行」核对一下再点「开始删除」—— 删除不可逆。', added ? '' : 'warn');
 }
 
@@ -1282,6 +1315,28 @@ function bindLibraryEvents() {
     if (running || autoRunning || probing) return;
     fetchVideoTitles().catch(function (e) { setHint('拉标题失败：' + ((e && e.message) || e), 'bad'); });
   });
+}
+
+/* --------------------------------------------------------- 主视图 / 副视图 */
+
+/**
+ * 面板只有两个视图：
+ *   main   —— 评论库（日常都在这）
+ *   import —— 导入历史（**一次性的初始化步骤**，不是日常功能）
+ *
+ * 为什么把导入单独拆出去：它是"装上扩展之前发的评论怎么补"这个一次性问题的答案，
+ * 放在主页当折叠区会让人以为它和库视图同等重要，喧宾夺主。
+ */
+function showView(name) {
+  const isImport = name === 'import';
+  $('view-main').classList.toggle('hide', isImport);
+  $('view-import').classList.toggle('hide', !isImport);
+  if (isImport) {
+    // 进来就顺手刷新一下导入区的情报
+    loadAicu().catch(function () {});
+  } else {
+    refreshLibrary().catch(function () {});
+  }
 }
 
 function render() {

@@ -242,6 +242,10 @@ body.console { max-width: 780px; margin: 0 auto; padding: 0 12px 40px; }
 
 /* ------------------------------------------------ 评论库（v1.5 的主界面） */
 
+/* 面板里两个视图：主视图（评论库）和副视图（导入历史）。同一时间只显示一个。 */
+.view { display: block; }
+.view-title { font-size: 13px; color: var(--txt-dim); }
+
 .toolbar { display: flex; gap: 8px; margin: 10px 0 2px; }
 .toolbar .grow { flex: 1 1 auto; min-width: 0; }
 
