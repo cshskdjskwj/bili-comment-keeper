@@ -5,6 +5,34 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.4.2] - 2026-10-04
+
+### 修复
+
+- **aicu 列表里每条评论给的应该是「方式0 / 方式2」两个**评论**链接，而不是视频链接**
+  （[`clean/clean.js`](clean/clean.js)、[`src/shared.js`](src/shared.js)）
+
+  以前整行是一个指向**视频**的链接 —— 点进去只到视频页，还得自己找评论。
+  现在把 aicu 页面上那两个链接原样搬过来：
+
+  | | 指向 | 用途 |
+  | --- | --- | --- |
+  | **方式0** | `bilibili.com/video/av<oid>?…&comment_root_id=…&comment_secondary_id=…#reply<rpid>` | 带 `#reply`，点开直接定位到这条评论 |
+  | **方式2** | `bilibili.com/h5/comment/sub?oid=<oid>&pageType=<type>&root=<会话根>` | B 站的楼中楼详情页，判断「没有该评论 / UP主已关闭评论区 / 暂无评论」就看它 |
+
+  另外列表里现在会直接标出探测结论：**`已确认没了`** / **`还在`**（以前只有一句汇总）。
+
+### 新增测试
+
+[`test/aicu.test.mjs`](test/aicu.test.mjs) 增到 **40 项**，新增 4 项把**用户提供的两个真实
+URL 当作验收标准**：
+
+- 方式2 对一级评论必须产出 `oid=117267354356619&pageType=1&root=317447018496`；
+- 方式2 对楼中楼必须产出 `…&pageType=11&root=316906615664`，其中 `root` 是**会话根**、
+  绝不能写成这条评论本人；
+- 缺字段时返回空串，不能拼出半截地址；
+- 两个链接各司其职（方式0 能落回同一条评论，且两者不相同）。
+
 ## [1.4.1] - 2026-10-04
 
 ### 新增

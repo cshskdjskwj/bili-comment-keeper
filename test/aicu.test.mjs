@@ -195,7 +195,7 @@ const shared = await import('../src/shared.js');
 const {
   normalizeAicuItem, aicuPageUrl, aicuTypeName,
   mergeAicuItems, listAicuItems, removeAicuItems, clearAicuStore, getAicuStore,
-  markAicuAlive, aicuCommentUrl, parseCommentUrl, buildTitle
+  markAicuAlive, aicuCommentUrl, aicuSubUrl, parseCommentUrl, buildTitle
 } = shared;
 
 const item = (rpid, over) => Object.assign({
@@ -731,6 +731,47 @@ await test('存进收藏夹的 URL：书签标题能正常生成（复用同一�
   assert.match(title, /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\] /);
   assert.match(title, /av117267354356619/);
   assert.match(title, /这条还活着/);
+});
+
+await test('方式2 的链接：必须和 aicu 页面上的一模一样（样本1）', async () => {
+  // 用户给的真实样本：https://www.bilibili.com/h5/comment/sub?oid=117267354356619&pageType=1&root=317447018496
+  const url = aicuSubUrl({ rpid: '317447018496', type: 1, oid: '117267354356619', root: '0' });
+  const u = new URL(url);
+  assert.equal(u.origin + u.pathname, 'https://www.bilibili.com/h5/comment/sub');
+  assert.equal(u.searchParams.get('oid'), '117267354356619');
+  assert.equal(u.searchParams.get('pageType'), '1');
+  assert.equal(u.searchParams.get('root'), '317447018496', '一级评论的 root 就是它自己');
+});
+
+await test('方式2 的链接：楼中楼用的是会话根（样本2）', async () => {
+  // 用户给的真实样本：...?oid=408598859&pageType=11&root=316906615664
+  // 注意 root 是**会话的根**，不是这条评论本人
+  const url = aicuSubUrl({ rpid: '999', type: 11, oid: '408598859', root: '316906615664' });
+  const u = new URL(url);
+  assert.equal(u.searchParams.get('oid'), '408598859');
+  assert.equal(u.searchParams.get('pageType'), '11');
+  assert.equal(u.searchParams.get('root'), '316906615664', '楼中楼要用会话根，不能写成本人');
+});
+
+await test('方式2 的链接：缺字段时返回空串', async () => {
+  assert.equal(aicuSubUrl({ rpid: '1', type: 1, oid: '' }), '');
+  assert.equal(aicuSubUrl({ rpid: '', type: 1, oid: '5' }), '');
+  assert.equal(aicuSubUrl({ rpid: '1', type: 'abc', oid: '5' }), '');
+  assert.equal(aicuSubUrl(null), '');
+});
+
+await test('两个链接各司其职：方式0 落回同一条评论，方式2 指向楼中楼详情页', async () => {
+  const it = { rpid: '317447018496', type: 1, oid: '117267354356619', root: '0', rank: 1 };
+
+  const c0 = aicuCommentUrl(it);
+  assert.match(c0, /bilibili\.com\/video\/av117267354356619/);
+  assert.match(c0, /#reply317447018496/);
+  assert.equal(parseCommentUrl(c0).rpid, '317447018496');
+
+  const c2 = aicuSubUrl(it);
+  assert.match(c2, /\/h5\/comment\/sub\?/);
+  // 两个链接不能是同一个
+  assert.notEqual(c0, c2);
 });
 
 /* ---------------------------------------------------------------- 汇总 */

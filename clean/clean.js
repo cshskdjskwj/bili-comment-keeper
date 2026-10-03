@@ -10,7 +10,7 @@ import {
   getSettings, getIndex, ensureFolder, parseCommentUrl, listBookmarks,
   sleep, randInt, escapeHtml, explainCode, sourceLabel, fmtTime, folderPath,
   getAicuStore, listAicuItems, clearAicuStore, removeAicuItems, markAicuAlive,
-  aicuPageUrl, aicuTypeName
+  aicuPageUrl, aicuTypeName, aicuCommentUrl, aicuSubUrl
 } from '../src/shared.js';
 
 const $ = id => document.getElementById(id);
@@ -447,10 +447,23 @@ async function loadAicu() {
   const shown = list.slice(0, AICU_RENDER_LIMIT);
   $('aicu-list').innerHTML = shown.length
     ? shown.map(function (it) {
-        const url = aicuPageUrl(it.type, it.oid);
         const text = String(it.message || '').replace(/\s+/g, ' ').trim();
         const when = it.ctime ? fmtTime(it.ctime * 1000) : '时间未知';
-        return `<div class="arc-item" title="${escapeHtml(text || it.rpid)}">• <a href="${escapeHtml(url)}" target="_blank">[${when}] ${escapeHtml(aicuTypeName(it.type))} · ${escapeHtml(text.slice(0, 40) || '评论')}</a></div>`;
+
+        // aicu 页面上每条评论右下角那两个链接，原样搬过来：
+        //   方式0 = B 站的评论地址（带 #reply，点开能定位到这条）
+        //   方式2 = B 站的楼中楼详情页（判断"没有该评论/已关闭评论区/暂无评论"就看它）
+        const c0 = aicuCommentUrl(it);
+        const c2 = aicuSubUrl(it);
+
+        const dead = it.alive === false ? ' <i class="tag gone">已确认没了</i>' : '';
+        const live = it.alive === true ? ' <i class="tag live">还在</i>' : '';
+
+        return `<div class="arc-item" title="${escapeHtml(text || it.rpid)}">• [${when}] ` +
+          `${escapeHtml(aicuTypeName(it.type))} · ${escapeHtml(text.slice(0, 40) || '评论')}${dead}${live}` +
+          (c0 ? ` <a href="${escapeHtml(c0)}" target="_blank" rel="noreferrer">方式0</a>` : '') +
+          (c2 ? ` <a href="${escapeHtml(c2)}" target="_blank" rel="noreferrer">方式2</a>` : '') +
+          `</div>`;
       }).join('') + (list.length > AICU_RENDER_LIMIT
         ? `<div class="empty" style="padding:8px 13px">…还有 ${list.length - AICU_RENDER_LIMIT} 条未显示</div>`
         : '')

@@ -419,6 +419,29 @@ export function aicuCommentUrl(item) {
   return u.toString() + '#reply' + rpid;
 }
 
+/**
+ * aicu 页面上每条评论右下角的「方式2」链接：B 站自己的楼中楼详情页。
+ *
+ * 点进去能直接看到这条会话，从而判断出「没有该评论 / UP主已关闭评论区 / 暂无评论」。
+ * 注意 root 用的是**会话根**：一级评论就是它自己，楼中楼才是所属会话的根 ——
+ * 这一点和 aicu 页面上的参数完全一致。
+ */
+export function aicuSubUrl(item) {
+  if (!item) return '';
+  const oid = String(item.oid || '');
+  const rpid = String(item.rpid || '');
+  const type = Number(item.type);
+  if (!/^\d+$/.test(oid) || !/^\d+$/.test(rpid) || !Number.isFinite(type)) return '';
+
+  const root = String(item.root || '0');
+  let u;
+  try { u = new URL('https://www.bilibili.com/h5/comment/sub'); } catch (e) { return ''; }
+  u.searchParams.set('oid', oid);
+  u.searchParams.set('pageType', String(type));
+  u.searchParams.set('root', root !== '0' ? root : rpid);
+  return u.toString();
+}
+
 /** 规整一条 aicu 记录；缺关键字段（rpid / type / oid）就返回 null */
 export function normalizeAicuItem(raw) {
   if (!raw || typeof raw !== 'object') return null;

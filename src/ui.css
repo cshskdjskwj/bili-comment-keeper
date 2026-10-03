@@ -19,6 +19,7 @@
   --sub: #9aa1b0;
 
   --ok: #48c78e;
+  --ok-soft: #1d2f28;
   --bad: #f2555a;
   --bad-bg: #2a1e20;
   --warn: #e2a33d;
@@ -43,6 +44,7 @@
     --sub: #737a89;
 
     --ok: #1a9560;
+  --ok-soft: #e3f6ed;
     --bad: #d5373d;
     --bad-bg: #fdecec;
     --warn: #a96c14;
@@ -99,6 +101,8 @@ h1 { font-size: 16px; margin: 0; font-weight: 600; }
   background: var(--bg3); color: var(--sub); border: 1px solid var(--line);
 }
 .tag.aicu { background: var(--pink-soft); color: var(--pink); border-color: transparent; }
+.tag.gone { background: var(--bg3); color: var(--sub); border-color: transparent; }
+.tag.live { background: var(--ok-soft, var(--pink-soft)); color: var(--ok, var(--pink)); border-color: transparent; }
 
 /* ----------------------------------------------------------- 弹窗 popup */
 
