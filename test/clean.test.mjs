@@ -283,246 +283,198 @@ await test('aicu 条目的 type 是字符串时也能用', async () => {
   assert.equal(r.oid, '888');
 });
 
-console.log('\n— 存活探测（只读，不发删除请求） —');
+console.log('\n— 存活判定（纯逻辑，拿真实样本对照） —');
 
-await test('探测：一级评论还在 → alive=true，且走的是只读 GET', async () => {
+await test('判定：12006「没有该评论」→ 已删（样本1就是这个）', async () => {
   const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
-  const calls = [];
-  sandbox.fetch = async (url) => {
-    calls.push(url);
-    return { json: async () => ({ code: 0, data: { root: { rpid: '999' } } }) };
-  };
-
-  const out = await sandbox.mainWorldCheck({ requestId: 'c1', type: 1, oid: '555', rpid: '999' });
-  assert.equal(out.alive, true);
-  assert.match(calls[0], /\/x\/v2\/reply\/reply/, '必须是读取接口');
-  assert.match(calls[0], /root=999/);
-  assert.ok(!/reply\/del/.test(calls[0]), '绝不能碰删除接口');
+  const r = sandbox.interpretReplyCheck({ code: 12006, message: '没有该评论' });
+  assert.equal(r.alive, false);
+  assert.equal(r.code, 12006);
 });
 
-await test('探测：12006 没有该评论 → alive=false', async () => {
+await test('判定：一级评论还在 → 活着，且 rootRpid 就是它自己', async () => {
   const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
-  sandbox.fetch = async () => ({ json: async () => ({ code: 12006, message: '没有该评论' }) });
-
-  const out = await sandbox.mainWorldCheck({ requestId: 'c2', type: 1, oid: '555', rpid: '999' });
-  assert.equal(out.alive, false);
+  const r = sandbox.interpretReplyCheck({ code: 0, data: { root: { rpid: 317447018496 } } });
+  assert.equal(r.alive, true);
+  assert.equal(r.rootRpid, '317447018496');
 });
 
-await test('探测：楼中楼被解析到根评论时，必须去会话里把本人找出来', async () => {
+await test('判定：会话还在但根评论没了 → 已删', async () => {
   const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
-  const calls = [];
-  sandbox.fetch = async (url) => {
-    calls.push(url);
-    // 第一次：拿二级评论 222 当 root 查 —— B 站解析到了根评论 111
-    if (url.includes('root=222')) {
-      return { json: async () => ({ code: 0, data: { root: { rpid: '111' } } }) };
-    }
-    // 第二次：拉 111 这条会话的回复，里面能找到 222
-    if (url.includes('root=111')) {
-      return {
-        json: async () => ({
-          code: 0,
-          data: { replies: [{ rpid: '222' }, { rpid: '333' }], page: { count: 2 } }
-        })
-      };
-    }
-    return { json: async () => ({ code: 0, data: {} }) };
-  };
-
-  const out = await sandbox.mainWorldCheck({ requestId: 'c3', type: 1, oid: '555', rpid: '222' });
-  assert.equal(out.alive, true, '会话里找到了本人 → 还在');
-  assert.ok(calls.length >= 2, '楼中楼必须多问一次会话列表，光看 code 会误判');
+  assert.equal(sandbox.interpretReplyCheck({ code: 0, data: {} }).alive, false);
 });
 
-await test('探测：楼中楼已经不在会话里 → alive=false', async () => {
+await test('判定：风控等其它 code 一律「不确定」，绝不误判成已删', async () => {
   const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
-  sandbox.fetch = async (url) => {
-    if (url.includes('root=222')) {
-      return { json: async () => ({ code: 0, data: { root: { rpid: '111' } } }) };
-    }
-    if (url.includes('root=111')) {
-      return { json: async () => ({ code: 0, data: { replies: [{ rpid: '333' }], page: { count: 1 } } }) };
-    }
-    return { json: async () => ({ code: 0, data: {} }) };
-  };
-
-  const out = await sandbox.mainWorldCheck({ requestId: 'c4', type: 1, oid: '555', rpid: '222' });
-  assert.equal(out.alive, false, '翻完会话都没有本人 → 已经没了');
+  assert.equal(sandbox.interpretReplyCheck({ code: -509, message: '请求过于频繁' }).alive, null);
+  assert.equal(sandbox.interpretReplyCheck(null).alive, null);
+  assert.equal(sandbox.interpretReplyCheck({ message: '没有 code' }).alive, null);
 });
 
-await test('探测：风控/未登录一律算「不确定」，绝不误判成已删除', async () => {
+await test('判定：楼中楼 —— rootRpid 不等于被查的那条，就得再去会话里确认', async () => {
   const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
-  sandbox.fetch = async () => ({ json: async () => ({ code: -509, message: '请求过于频繁' }) });
-
-  const out = await sandbox.mainWorldCheck({ requestId: 'c5', type: 1, oid: '555', rpid: '999' });
-  assert.equal(out.ok, false);
-  assert.equal(out.alive, null, '拿不准就得给 null —— 误判成"没了"会把还活着的评论漏掉');
+  // 样本2：查的是二级评论，B 站把 root 给成了会话的根 316906615664
+  const r = sandbox.interpretReplyCheck({ code: 0, data: { root: { rpid: 316906615664 } } });
+  assert.equal(r.alive, true, 'code 0 只说明这条会话还在');
+  assert.equal(r.rootRpid, '316906615664');
 });
 
-await test('探测：接口返回不是 JSON 时也是「不确定」', async () => {
+await test('buildReplyUrl：参数齐全', async () => {
   const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
-  sandbox.fetch = async () => ({ status: 200, text: async () => '<!DOCTYPE html><html>被拦了</html>' });
-
-  const out = await sandbox.mainWorldCheck({ requestId: 'c6', type: 1, oid: '555', rpid: '999' });
-  assert.equal(out.alive, null);
+  const u = sandbox.buildReplyUrl({ type: 1, oid: '117267354356619', root: '317447018496', pn: 1, ps: 1 });
+  assert.match(u, /\/x\/v2\/reply\/reply/);
+  assert.match(u, /type=1/);
+  assert.match(u, /oid=117267354356619/);
+  assert.match(u, /root=317447018496/);
+  assert.ok(!/reply\/del/.test(u), '探测绝不能碰删除接口');
 });
 
-await test('探测结果写进 window.__bcDelResults（和删除共用同一条回传通道）', async () => {
-  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
-  sandbox.fetch = async () => ({ json: async () => ({ code: 12006, message: '没有该评论' }) });
+console.log('\n— 取数据：两条路自动选 —');
 
-  await sandbox.mainWorldCheck({ requestId: 'c7', type: 1, oid: '555', rpid: '999' });
-  const stored = sandbox.window.__bcDelResults.c7;
-  assert.ok(stored, '必须写进结果槽，控制台靠它取结果');
-  assert.equal(stored.alive, false);
+await test('扩展直发：通了就直接用，压根不去动标签页', async () => {
+  const { sandbox, worlds } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.probeDirectWorks = null;
+  sandbox.fetch = async () => ({ status: 200, text: async () => JSON.stringify({ code: 12006 }) });
+
+  const r = await sandbox.fetchReplyRaw({ type: 1, oid: '5', root: '9', pn: 1, ps: 1 });
+  assert.equal(r.json.code, 12006);
+  assert.equal(sandbox.probeDirectWorks, true);
+  assert.equal(worlds.length, 0, '直发通了就不该去借 bilibili 标签页');
 });
 
-await test('checkAliveOne：把注入结果收敛成 alive 三态', async () => {
-  const { sandbox } = await makeSandbox(async (arg, store) => {
+await test('扩展直发被拦成 HTML → 自动退回借标签页，并记住以后别再试直发', async () => {
+  const { sandbox, worlds } = await makeSandbox(async (arg, store) => {
     setTimeout(() => {
-      store[arg.requestId] = { requestId: arg.requestId, ok: true, alive: false, code: 12006, message: '' };
+      store[arg.requestId] = {
+        requestId: arg.requestId, ok: true, status: 200, text: JSON.stringify({ code: 12006 })
+      };
     }, 550);
     return [{ result: undefined }];
   });
+  sandbox.probeDirectWorks = null;
+  sandbox.fetch = async () => ({ status: 412, text: async () => '<!DOCTYPE html><html>风险</html>' });
 
-  const r = await sandbox.checkAliveOne(1, { type: 1, oid: '5', rpid: '9' });
+  const first = await sandbox.fetchReplyRaw({ type: 1, oid: '5', root: '9', pn: 1, ps: 1 });
+  assert.equal(first.json.code, 12006, '退回标签页之后应该拿到数据');
+  assert.equal(sandbox.probeDirectWorks, false);
+
+  const before = worlds.length;
+  const second = await sandbox.fetchReplyRaw({ type: 1, oid: '5', root: '9', pn: 1, ps: 1 });
+  assert.equal(second.json.code, 12006);
+  assert.equal(sandbox.probeDirectWorks, false, '记住哪条路通，不必每条都重新试错');
+  assert.ok(worlds.length > before, '第二次应该直接走标签页那条路');
+});
+
+console.log('\n— checkAliveOne：完整判定 —');
+
+await test('一级评论还在 → 活着', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.fetch = async () => ({
+    status: 200, text: async () => JSON.stringify({ code: 0, data: { root: { rpid: 999 } } })
+  });
+  const r = await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '999' });
+  assert.equal(r.alive, true);
+});
+
+await test('一级评论没了 → 已删', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.fetch = async () => ({ status: 200, text: async () => JSON.stringify({ code: 12006 }) });
+  const r = await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '999' });
   assert.equal(r.alive, false);
 });
 
-await test('checkAliveOne：拿不准时返回 null 而不是 false', async () => {
-  const { sandbox } = await makeSandbox(async (arg, store) => {
-    setTimeout(() => {
-      store[arg.requestId] = { requestId: arg.requestId, ok: false, alive: null, code: -509, message: '请求过于频繁' };
-    }, 550);
-    return [{ result: undefined }];
-  });
-
-  const r = await sandbox.checkAliveOne(1, { type: 1, oid: '5', rpid: '9' });
-  assert.equal(r.alive, null);
-});
-
-await test('注入永不 settle 时也必须返回 —— 绝不能静默卡死（线上真实事故）', async () => {
-  // 事故现场：点了「探测存活」之后界面一动不动、风扇狂转、连「停止」都没反应。
-  // 根因是 await chrome.scripting.executeScript(...) 永不 settle，
-  // 于是 Promise.race 里的总超时**根本执行不到**。这条用例就是钉住这个回归。
-  const { sandbox } = await makeSandbox(async () => new Promise(function () { /* 永远不 settle */ }));
-  sandbox.BC_DELETE_TIMEOUT_MS = 2500;
-
-  const t0 = Date.now();
-  const r = await sandbox.deleteOne(1, { type: 1, oid: '5', rpid: '9' });
-  const took = Date.now() - t0;
-
-  assert.equal(r.ok, false);
-  assert.match(r.message, /等待页面响应超时/, `实际：${r.message}`);
-  assert.ok(took < 8000, `必须在总超时内返回，实际 ${took}ms`);
-});
-
-await test('注入永不 settle 时，探测也一样会返回', async () => {
-  const { sandbox } = await makeSandbox(async () => new Promise(function () { /* 永远不 settle */ }));
-
-  const t0 = Date.now();
-  const r = await sandbox.checkAliveOne(1, { type: 1, oid: '5', rpid: '9' });
-  const took = Date.now() - t0;
-
-  assert.equal(r.alive, null, '拿不准就是 null，不能卡住也不能误判');
-  assert.ok(took < 20000, `必须返回，实际 ${took}ms`);
-});
-
-await test('withTimeout：到点就返回兜底值', async () => {
-  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
-
-  const t0 = Date.now();
-  const v = await sandbox.withTimeout(new Promise(function () {}), 400, '兜底');
-  assert.equal(v, '兜底');
-  assert.ok(Date.now() - t0 < 3000);
-
-  const fast = await sandbox.withTimeout(Promise.resolve('正常'), 5000, '兜底');
-  assert.equal(fast, '正常', '正常返回时不该动它');
-});
-
-await test('删除和探测都在**主世界**跑 —— Cookie / CORS 与页面自己发请求一致', async () => {
-  // 为什么不去隔离世界：那里的 fetch 虽然干净，但 CORS / Origin 行为与主世界并不完全一样，
-  // 而"页面自己的源 + 原生 fetch"这条路是已经被证明可用的，就留在它上面。
-  const { sandbox, worlds } = await makeSandbox(async (arg, store) => {
-    setTimeout(() => {
-      store[arg.requestId] = { requestId: arg.requestId, ok: true, alive: true, code: 0, message: '' };
-    }, 550);
-    return [{ result: undefined }];
-  });
-
-  await sandbox.checkAliveOne(1, { type: 1, oid: '5', rpid: '9' });
-  await sandbox.deleteOne(1, { type: 1, oid: '5', rpid: '9' });
-
-  assert.ok(worlds.length >= 4, `注入 + 轮询各两次，至少四次，实际 ${worlds.length}`);
-  assert.ok(worlds.every(w => w === 'MAIN'),
-    `删除和探测都该在主世界，实际用过：${[...new Set(worlds)].join(', ')}`);
-});
-
-await test('扩展自己发的请求必须用「原生 fetch」，不能穿过页面的包装层', async () => {
-  // 这就是「一条都探测不到」的症结：主世界的 window.fetch 早就不是原生 fetch 了，
-  // 它被 recorder-main.js 和 B 站自己的 API 层先后包过。
-  // recorder-main.js 在 document_start 把原生版本抢存到 window.__bcNativeFetch，
-  // 这里断言：只要它在，删除和探测都必须用它。
-  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
-
-  const seen = [];
-  const wrapped = async () => { seen.push('wrapped'); return { json: async () => ({ code: 12006 }) }; };
-  const native = async () => { seen.push('native'); return { json: async () => ({ code: 12006 }) }; };
-
-  sandbox.fetch = wrapped;
-  sandbox.window.__bcNativeFetch = native;
-
-  await sandbox.mainWorldCheck({ requestId: 'n1', type: 1, oid: '555', rpid: '999' });
-  await sandbox.mainWorldDelete({ requestId: 'n2', type: 1, oid: '555', rpid: '999' });
-
-  assert.deepEqual(seen, ['native', 'native'],
-    `删除和探测都该走原生 fetch，实际：${seen.join(', ')}`);
-});
-
-await test('没有原生 fetch 可抢时，退回页面自己的 fetch（不能直接报错）', async () => {
+await test('楼中楼：会话里能找到本人 → 活着', async () => {
   const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
   const seen = [];
-  sandbox.fetch = async () => { seen.push('page'); return { json: async () => ({ code: 12006 }) }; };
-  delete sandbox.window.__bcNativeFetch;
-
-  await sandbox.mainWorldCheck({ requestId: 'n3', type: 1, oid: '555', rpid: '999' });
-  assert.deepEqual(seen, ['page']);
-});
-
-await test('探测不带任何凭据 —— 查询评论本来就不需要登录', async () => {
-  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
-  const inits = [];
-  sandbox.fetch = async (url, init) => {
-    inits.push(init || {});
-    return { status: 200, text: async () => JSON.stringify({ code: 12006 }) };
+  sandbox.fetch = async (url) => {
+    seen.push(url);
+    if (/root=222/.test(url)) {
+      return { status: 200, text: async () => JSON.stringify({ code: 0, data: { root: { rpid: 111 } } }) };
+    }
+    return {
+      status: 200,
+      text: async () => JSON.stringify({ code: 0, data: { replies: [{ rpid: 222 }, { rpid: 333 }], page: { count: 2 } } })
+    };
   };
 
-  await sandbox.mainWorldCheck({ requestId: 'c1', type: 1, oid: '5', rpid: '9' });
-  assert.ok(inits.length >= 1);
-  assert.equal(inits[0].credentials, 'omit',
-    '探测不该带 cookie：别人本来就能查你的评论，带上只会平添风险');
+  const r = await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '222' });
+  assert.equal(r.alive, true);
+  assert.ok(seen.length >= 2, '楼中楼必须多问一次会话，光看 code 会误判');
+  assert.ok(seen.some(u => /root=111/.test(u)), '要拿解析出来的根评论去查会话');
 });
 
-await test('探测被反爬拦成 HTML 时，给出说得清的原因', async () => {
+await test('楼中楼：会话还在但本人不在里面 → 已删（样本2的真实情形）', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.fetch = async (url) => {
+    if (/root=999/.test(url)) {
+      // B 站把这个二级评论解析到了会话的根
+      return { status: 200, text: async () => JSON.stringify({ code: 0, data: { root: { rpid: 316906615664 } } }) };
+    }
+    return {
+      status: 200,
+      text: async () => JSON.stringify({ code: 0, data: { replies: [{ rpid: 1 }, { rpid: 2 }], page: { count: 2 } } })
+    };
+  };
+
+  const r = await sandbox.checkAliveOne({ type: 11, oid: '408598859', rpid: '999' });
+  assert.equal(r.alive, false, '翻完会话都没有本人 → 判定为已删');
+});
+
+await test('楼中楼：会话太长没翻完 → 「不确定」，不能当成已删', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.fetch = async (url) => {
+    if (/ps=1/.test(url)) {
+      return { status: 200, text: async () => JSON.stringify({ code: 0, data: { root: { rpid: 111 } } }) };
+    }
+    // 每次都返回一堆别人的评论，而且 count 远大于我们翻过的量
+    return {
+      status: 200,
+      text: async () => JSON.stringify({ code: 0, data: { replies: [{ rpid: 7 }], page: { count: 9999 } } })
+    };
+  };
+
+  const r = await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '222' });
+  assert.equal(r.alive, null, '没确认完就不能下结论');
+  assert.match(r.message, /太长/);
+});
+
+await test('探测拿不准时的原因会原样带出来（便于排查）', async () => {
   const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
   sandbox.fetch = async () => ({ status: 412, text: async () => '<!DOCTYPE html><html>风险</html>' });
+  sandbox.window.__bcNativeFetch = sandbox.fetch;
 
-  const out = await sandbox.mainWorldCheck({ requestId: 'c2', type: 1, oid: '5', rpid: '9' });
-  assert.equal(out.alive, null, '拿不准就是 null，不能当成"已经没了"');
-  assert.match(out.message, /反爬|网页/, `实际：${out.message}`);
+  const r = await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '999' });
+  assert.equal(r.alive, null);
+  assert.ok(r.message && r.message.length > 0, '必须给得出原因');
 });
 
-await test('自检：探测不需要登录，删除才需要', async () => {
-  const { sandbox } = await makeSandbox(async () => [
-    { result: { hasJct: false, href: 'https://www.bilibili.com/', ready: 'complete' } }
-  ]);
-  sandbox.BC_PREFLIGHT_MS = 300;
+console.log('\n— 注入的搬运函数 —');
 
-  const forDelete = await sandbox.preflight(1);
-  assert.equal(forDelete.ok, false, '删除必须登录，默认仍然要拦');
+await test('mainWorldFetchReply：用原生 fetch、不带凭据、只把原文带回来', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const calls = [];
+  sandbox.window.__bcNativeFetch = async (url, init) => {
+    calls.push({ url, init });
+    return { status: 200, text: async () => '{"code":12006}' };
+  };
+  sandbox.fetch = async () => { throw new Error('不该用被包过的 fetch'); };
 
-  const forProbe = await sandbox.preflight(1, { requireLogin: false });
-  assert.equal(forProbe.ok, true, '探测不需要登录，不该被拦下来');
+  const out = await sandbox.mainWorldFetchReply({ requestId: 'x', type: 1, oid: '5', root: '9', pn: 1, ps: 1 });
+  assert.equal(out.ok, true);
+  assert.equal(out.text, '{"code":12006}', '只搬运原文，判断交给控制台');
+  assert.equal(calls[0].init.credentials, 'omit', '探测不带任何凭据');
+  assert.match(calls[0].url, /reply\/reply/);
+  assert.ok(sandbox.window.__bcDelResults.x, '结果要写进结果槽，供控制台取回');
+});
+
+await test('mainWorldFetchReply：页面里没有原生 fetch 时退回页面的 fetch', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const seen = [];
+  delete sandbox.window.__bcNativeFetch;
+  sandbox.fetch = async () => { seen.push(1); return { status: 200, text: async () => '{"code":0}' }; };
+
+  await sandbox.mainWorldFetchReply({ requestId: 'y', type: 1, oid: '5', root: '9', pn: 1, ps: 1 });
+  assert.equal(seen.length, 1);
 });
 
 /* ---------------------------------------------------------------- 汇总 */

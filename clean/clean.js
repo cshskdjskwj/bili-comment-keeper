@@ -71,28 +71,19 @@ async function mainWorldDelete(arg) {
 }
 
 /**
- * 注入网页主世界执行：**只读地**判断一条评论还在不在（不发任何删除请求）。
+ * 注入网页主世界执行：**只把接口的原始返回搬回来**，不做任何判断。
  *
- * 用的是评论区的读取接口 GET /x/v2/reply/reply?type=&oid=&root=<rpid>：
- *   还在   → code 0，data.root 有值
- *   没了   → code 12006「没有该评论」
- * 这两种返回都用真实数据实测过。
+ * 为什么把判断挪走：判断逻辑（尤其是楼中楼的确认）放在这里的话，它就跑在页面里、
+ * 依赖注入 + 序列化，既难测也难查。现在这里只负责"发一个 GET、把原文带回来"，
+ * 判定统一由控制台那侧做 —— 那部分是纯函数，有测试盯着。
  *
- * **不需要登录、不需要 cookie** —— 别人本来就能查你的评论。所以这里用
- * `credentials: 'omit'`，不带任何凭据：探测因此在你没登录时也能用，
- * 而且完全不存在 CSRF 之类的顾虑。
+ * 用的是**原生 fetch**（recorder-main.js 在 document_start 抢存的那份）。
+ * 直接用 window.fetch 的话，请求会穿过 B 站自己的 API 包装层，行为不可预期。
  *
- * 但**必须从 B 站页面里发**（同站、不带 Origin 头）。实测过：一旦请求带上
- * `Origin: chrome-extension://…`（扩展页面直接 fetch 就是这个下场），
- * B 站的反爬会回一个 HTML 页面而不是 JSON。所以探测仍然要借一个 bilibili 标签页。
- *
- * **楼中楼要特别处理**：把二级评论的 rpid 当 root 去查时，B 站会把它解析到所属的
- * 根评论、照样返回 code 0 —— 所以光看 code 不够，还得去那条会话的回复列表里
- * 找它本人在不在。找到了才算活着。
- *
- * 拿不准的一律返回 alive=null（宁可留着让后面删一次，也不误杀）。
+ * **不需要登录、不需要 cookie**：查询评论的接口是公开可读的，别人本来就能查你的评论，
+ * 所以这里用 credentials: 'omit'，不带任何凭据。
  */
-async function mainWorldCheck(arg) {
+async function mainWorldFetchReply(arg) {
   const done = out => {
     out.requestId = arg.requestId;
     try {
@@ -107,83 +98,27 @@ async function mainWorldCheck(arg) {
     return out;
   };
 
-  const q = 'type=' + encodeURIComponent(String(arg.type)) +
-    '&oid=' + encodeURIComponent(String(arg.oid));
+  const url = 'https://api.bilibili.com/x/v2/reply/reply?type=' +
+    encodeURIComponent(String(arg.type)) +
+    '&oid=' + encodeURIComponent(String(arg.oid)) +
+    '&root=' + encodeURIComponent(String(arg.root)) +
+    '&pn=' + encodeURIComponent(String(arg.pn || 1)) +
+    '&ps=' + encodeURIComponent(String(arg.ps || 1));
 
-  // 用原生 fetch（recorder-main.js 在 document_start 抢存的那份）。
-  // 这就是「一条都探测不到」的症结：主世界的 window.fetch 已经不是原生 fetch 了，
-  // 它被 recorder-main.js 和 B 站自己的 API 层先后包过，行为不可预期。
   const doFetch = (typeof window.__bcNativeFetch === 'function')
     ? window.__bcNativeFetch
     : window.fetch.bind(window);
 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 15000);
-
   try {
-    // credentials: 'omit' —— 查询评论本来就不需要登录，别带任何凭据
-    const res = await doFetch('https://api.bilibili.com/x/v2/reply/reply?' + q +
-      '&root=' + encodeURIComponent(String(arg.rpid)) + '&pn=1&ps=1',
-      { credentials: 'omit', signal: ctrl.signal });
-
+    const res = await doFetch(url, { credentials: 'omit', signal: ctrl.signal });
     const text = await res.text().catch(() => '');
-    let json = null;
-    try { json = JSON.parse(text); } catch (e) { json = null; }
-
-    if (!json) {
-      // 这一步最值得说清楚：拿回 HTML 通常意味着请求被反爬拦了
-      const looksHtml = /^\s*</.test(text);
-      return done({
-        ok: false, alive: null, code: null,
-        message: looksHtml
-          ? '接口回了网页而不是数据（多半被反爬拦了），HTTP ' + res.status
-          : '接口返回不是 JSON，HTTP ' + res.status
-      });
-    }
-
-    if (json.code === 12006) {
-      return done({ ok: true, alive: false, code: 12006, message: json.message || '没有该评论' });
-    }
-    if (json.code !== 0) {
-      // 风控、未登录之类的错误：当"不确定"，绝不误判成已删除
-      return done({ ok: false, alive: null, code: json.code, message: json.message || '' });
-    }
-
-    const root = json.data && json.data.root;
-    if (!root) {
-      return done({ ok: true, alive: false, code: 0, message: '会话还在，但这条评论已经不在了' });
-    }
-
-    // 一级评论：B 站返回的 root 就是它自己
-    if (String(root.rpid) === String(arg.rpid)) {
-      return done({ ok: true, alive: true, code: 0, message: '' });
-    }
-
-    // 楼中楼：B 站把我们解析到了所属的根评论，得去会话里把它本人找出来
-    const rootId = String(root.rpid);
-    for (let pn = 1; pn <= 3; pn++) {
-      const r2 = await doFetch('https://api.bilibili.com/x/v2/reply/reply?' + q +
-        '&root=' + encodeURIComponent(rootId) + '&pn=' + pn + '&ps=49',
-        { credentials: 'omit', signal: ctrl.signal });
-      const j2 = await r2.json().catch(() => null);
-      if (!j2 || j2.code !== 0) break;
-
-      const list = (j2.data && j2.data.replies) || [];
-      for (let i = 0; i < list.length; i++) {
-        if (String(list[i].rpid) === String(arg.rpid)) {
-          return done({ ok: true, alive: true, code: 0, message: '' });
-        }
-      }
-
-      const count = (j2.data && j2.data.page && j2.data.page.count) || 0;
-      if (pn * 49 >= count) {
-        return done({ ok: true, alive: false, code: 0, message: '会话里已经没有这条了' });
-      }
-    }
-    return done({ ok: false, alive: null, code: 0, message: '这条会话太长，没能确认这一条' });
+    // 只带原文回来，解析交给控制台
+    return done({ ok: true, status: res.status, text: String(text).slice(0, 50000) });
   } catch (err) {
-    const msg = (err && err.name === 'AbortError') ? '探测超时' : ('网络错误：' + ((err && err.message) || err));
-    return done({ ok: false, alive: null, code: null, message: msg });
+    const msg = (err && err.name === 'AbortError') ? '请求超时（15 秒）' : ('网络错误：' + ((err && err.message) || err));
+    return done({ ok: false, message: msg });
   } finally {
     clearTimeout(timer);
   }
@@ -614,32 +549,13 @@ async function probeAicuAlive() {
   setAicuProbing(true);
   probeStop = false;
 
-  let tabId;
-  try {
-    tabId = await acquireWorkerTab();
-  } catch (e) {
-    setAicuProbing(false);
-    setAicuHint('打不开 bilibili 页面，探测已中止。', 'bad');
-    return;
-  }
+  // 不预先开标签页、也不做登录自检：
+  // 探测的接口是公开只读的（不需要登录），而且优先让扩展自己直发 ——
+  // 只有直发被反爬拦了才会去借 bilibili 标签页，那一步由取数据的地方按需触发。
+  // 先单独试一条，把结果当场说出来 —— 不要让人对着进度等半天才发现根本不通。
+  const firstTry = await withTimeout(checkAliveOne(todo[0]), 20000,
+    { alive: null, message: '第一条就超时（20 秒）' });
 
-  // 探测不需要登录（别人本来就能查你的评论），所以登录检查跳过。
-  // 只需要确认「能往 bilibili 页面里注入脚本」这一件事。
-  const check = await preflight(tabId, { requireLogin: false });
-  if (!check.ok) {
-    setAicuProbing(false);
-    setAicuHint('探测没有开始。' + check.reason, 'bad');
-    return;
-  }
-
-  // 先单独试一条，把结果当场说出来 —— 不要让人对着进度等半天才发现根本不通
-  const firstTry = await withTimeout(checkAliveOne(tabId, todo[0]), 14000,
-    { alive: null, message: '第一条就超时（14 秒）' });
-  if (firstTry && firstTry.tabGone) {
-    setAicuProbing(false);
-    setAicuHint('探测没有开始：bilibili 标签页读取失败。把那个页面刷新一下再试。', 'bad');
-    return;
-  }
   log(`探测试运行：第 1 条 rpid ${todo[0].rpid} → ` +
     (firstTry.alive === true ? '还在' : firstTry.alive === false ? '已经没了' : '没问出结果')
     + (firstTry.message ? '（' + firstTry.message + '）' : ''));
@@ -647,7 +563,7 @@ async function probeAicuAlive() {
   if (firstTry.alive === null) {
     setAicuProbing(false);
     setAicuHint('探测没有开始：第一条就没问出结果。' + (firstTry.message || '') +
-      '　把那个 bilibili 标签页刷新一下（F5）再试。', 'bad');
+      '　把 bilibili 标签页刷新一下（F5）再试，或者先随便打开一个 bilibili 页面。', 'bad');
     return;
   }
 
@@ -674,21 +590,14 @@ async function probeAicuAlive() {
     // 循环也一定能往下走" —— 这个功能已经因为一处不 settle 的 await 卡死过一次了。
     let r = { alive: null, message: '内部超时' };
     try {
-      r = await withTimeout(checkAliveOne(tabId, it), 14000, { alive: null, message: '这条探测超时（14 秒）' });
+      r = await withTimeout(checkAliveOne(it), 25000, { alive: null, message: '这条探测超时（25 秒）' });
     } catch (e) {
       r = { alive: null, message: '探测出错：' + ((e && e.message) || e) };
     }
 
     const took = Date.now() - startedAt;
 
-    if (r.tabGone) {
-      log(`探测 ${i + 1}/${todo.length}：通道标签页失效，正在换一个…`);
-      workerTabId = null;
-      workerCreated = false;
-      try { tabId = await withTimeout(acquireWorkerTab(), 12000, null); } catch (e) { /* 下一轮再试 */ }
-      if (!tabId) { setAicuHint('通道标签页打不开了，探测已中止。', 'bad'); break; }
-      unknown++;
-    } else if (r.alive === true) {
+    if (r.alive === true) {
       alive++; marks[it.rpid] = true; errStreak = 0;
     } else if (r.alive === false) {
       gone++; marks[it.rpid] = false; errStreak = 0;
@@ -1246,19 +1155,157 @@ async function deleteOne(tabId, target) {
   return { ok: !!r.ok, code: r.code, message: r.message || '' };
 }
 
-/** 只读地探测一条还在不在。返回 { alive: true|false|null, message, tabGone? } */
-async function checkAliveOne(tabId, item) {
-  // 只读查询本来就快，给 10 秒足够；短一点还有一个好处：点「停止」时等待更短。
-  // 留在主世界（连同 recorder-main.js 抢存的原生 fetch 一起）——
-  // 这样 Cookie / CORS 的行为和页面自己发请求完全一致，是已经被证明可用的那条路。
-  const r = await runInjected(tabId, mainWorldCheck,
-    { type: item.type, oid: item.oid, rpid: item.rpid }, 10000, 'MAIN');
-  if (r.tabGone) return { alive: null, tabGone: true, message: r.message };
-  return {
-    alive: (r.alive === true || r.alive === false) ? r.alive : null,
-    code: r.code,
-    message: r.message || ''
-  };
+/* ------------------------------------------------ 存活判定（纯逻辑，不走网络） */
+
+/** 拼出 /x/v2/reply/reply 的地址 */
+function buildReplyUrl(arg) {
+  return 'https://api.bilibili.com/x/v2/reply/reply?type=' + encodeURIComponent(String(arg.type)) +
+    '&oid=' + encodeURIComponent(String(arg.oid)) +
+    '&root=' + encodeURIComponent(String(arg.root)) +
+    '&pn=' + encodeURIComponent(String(arg.pn || 1)) +
+    '&ps=' + encodeURIComponent(String(arg.ps || 1));
+}
+
+function safeJson(text) {
+  try { return JSON.parse(text); } catch (e) { return null; }
+}
+
+/**
+ * 解读 /x/v2/reply/reply 的返回。
+ *
+ * 用真实数据实测过（含用户提供的两个样本）：
+ *   还在       → code 0，data.root 有值
+ *   已经没了   → code 12006「没有该评论」
+ *   风控/其它  → 一律"不确定"，绝不误判成已删除
+ *
+ * 返回 { alive: true|false|null, code, message, rootRpid }
+ * 注意 alive=true 时还要看 rootRpid 是不是等于被查的那条 —— 不等于说明这是
+ * **楼中楼**，B 站把我们解析到了所属的根评论，还得再去会话里确认本人。
+ */
+function interpretReplyCheck(json) {
+  if (!json || typeof json.code !== 'number') {
+    return { alive: null, message: '接口返回的不是数据（多半被反爬拦了）' };
+  }
+  if (json.code === 12006) {
+    return { alive: false, code: 12006, message: json.message || '没有该评论' };
+  }
+  if (json.code !== 0) {
+    return { alive: null, code: json.code, message: json.message || '' };
+  }
+  const root = json.data && json.data.root;
+  if (!root) {
+    return { alive: false, code: 0, message: '会话还在，但这条评论已经不在了' };
+  }
+  return { alive: true, code: 0, message: '', rootRpid: String(root.rpid) };
+}
+
+/* ------------------------------------------------ 取数据：两条路自动选 */
+
+/**
+ * 记住哪条取数通道通。null=还没试过；true/false=以后照这个来。
+ * 用 `var` 是故意的：它会挂到全局对象上，测试里能直接观察/设置它。
+ */
+var probeDirectWorks = null;
+
+/**
+ * 拿一次 /x/v2/reply/reply 的原始返回。两条路：
+ *
+ *   ① **扩展自己直发**：查询评论的接口是公开只读的，不需要登录、不需要 cookie，
+ *      所以理论上扩展自己就能问，而且快得多、不用开标签页。
+ *   ② **借一个 bilibili 标签页发**：实测扩展发的请求会带上
+ *      `Origin: chrome-extension://…`，B 站反爬这种情况下会回 HTML 而不是 JSON；
+ *      从 B 站页面里发（同站、不带 Origin）才是稳定可用的那条。
+ *
+ * 先试 ①，被拦了就永久切到 ② —— 不会比只有 ② 更差，而 ① 通的话会快很多。
+ */
+async function fetchReplyRaw(arg) {
+  if (probeDirectWorks !== false) {
+    try {
+      const res = await withTimeout(fetch(buildReplyUrl(arg), { credentials: 'omit' }), 12000, null);
+      if (res) {
+        const text = await res.text().catch(() => '');
+        const json = safeJson(text);
+        if (json && typeof json.code === 'number') {
+          if (probeDirectWorks === null) {
+            probeDirectWorks = true;
+            log('探测通道：扩展直接发就行（更快，也不用开标签页）');
+          }
+          return { json: json };
+        }
+        probeDirectWorks = false;
+        log('探测通道：扩展直接发被拦了（HTTP ' + res.status + '），改用 bilibili 标签页。');
+      } else {
+        probeDirectWorks = false;
+        log('探测通道：扩展直接发超时，改用 bilibili 标签页。');
+      }
+    } catch (e) {
+      probeDirectWorks = false;
+      log('探测通道：扩展直接发失败（' + ((e && e.message) || e) + '），改用 bilibili 标签页。');
+    }
+  }
+
+  // 路 ②：借 bilibili 标签页发
+  let tabId = null;
+  try {
+    tabId = await withTimeout(acquireWorkerTab(), 20000, null);
+  } catch (e) { tabId = null; }
+  if (!tabId) return { error: '打不开 bilibili 标签页' };
+
+  const r = await runInjected(tabId, mainWorldFetchReply, {
+    type: arg.type, oid: arg.oid, root: arg.root, pn: arg.pn, ps: arg.ps
+  }, 12000, 'MAIN');
+
+  if (r.tabGone) {
+    workerTabId = null;
+    workerCreated = false;
+    return { error: r.message || 'bilibili 标签页失效' };
+  }
+  if (!r.ok) return { error: r.message || '页面里没取到数据' };
+
+  const json = safeJson(r.text);
+  if (!json) {
+    return { error: '页面取回的是网页而不是数据（HTTP ' + r.status + '），可能被反爬拦了' };
+  }
+  return { json: json };
+}
+
+/**
+ * 判断一条评论还在不在。返回 { alive: true|false|null, message }
+ *
+ * 楼中楼那一步是重点：把二级评论的 rpid 当 root 去查时，B 站会把它解析到所属的
+ * 根评论、照样返回 code 0 —— 光看 code 会把已删的楼中楼误判成还在。
+ * 所以这种情况必须再去那条会话的回复列表里把**它本人**找出来，找到才算活着。
+ */
+async function checkAliveOne(item) {
+  const first = await fetchReplyRaw({ type: item.type, oid: item.oid, root: item.rpid, pn: 1, ps: 1 });
+  if (first.error) return { alive: null, message: first.error };
+
+  const a = interpretReplyCheck(first.json);
+  if (a.alive !== true) return { alive: a.alive, code: a.code, message: a.message };
+
+  // 一级评论：B 站返回的 root 就是它自己
+  if (a.rootRpid === String(item.rpid)) return { alive: true, code: 0, message: '' };
+
+  // 楼中楼：去所属会话里把它本人找出来
+  const rootId = a.rootRpid;
+  for (let pn = 1; pn <= 3; pn++) {
+    const r = await fetchReplyRaw({ type: item.type, oid: item.oid, root: rootId, pn: pn, ps: 49 });
+    if (r.error) return { alive: null, message: r.error };
+
+    const j = r.json;
+    if (j.code !== 0) return { alive: null, code: j.code, message: j.message || '' };
+
+    const list = (j.data && j.data.replies) || [];
+    for (let i = 0; i < list.length; i++) {
+      if (String(list[i].rpid) === String(item.rpid)) return { alive: true, code: 0, message: '' };
+    }
+
+    const count = (j.data && j.data.page && j.data.page.count) || 0;
+    if (pn * 49 >= count) {
+      return { alive: false, code: 0, message: '会话里已经没有这条了' };
+    }
+  }
+  return { alive: null, code: 0, message: '这条会话太长，没能确认' };
 }
 
 /**
