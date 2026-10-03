@@ -2,16 +2,24 @@
   "manifest_version": 3,
   "name": "B站评论管家",
   "short_name": "评论管家",
-  "version": "1.1.0",
-  "description": "自动记录自己在 B 站发布的每条评论链接并存入书签栏，支持一键批量删除并把已删链接原样归档。",
+  "version": "1.2.0",
+  "description": "自动记录自己在 B 站发布的每条评论链接并存入书签栏，支持一键批量删除、把已删链接原样归档，并可导入 aicu.cc 的历史评论补删。",
   "author": "cshskdjskwj",
   "homepage_url": "https://github.com/cshskdjskwj/bili-comment-keeper",
-  "minimum_chrome_version": "111",
+  "minimum_chrome_version": "116",
+
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
 
   "permissions": [
     "bookmarks",
     "storage",
-    "scripting"
+    "scripting",
+    "sidePanel"
   ],
 
   "host_permissions": [
@@ -26,10 +34,20 @@
 
   "action": {
     "default_popup": "popup/popup.html",
-    "default_title": "B站评论管家"
+    "default_title": "B站评论管家",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
 
   "options_page": "options/options.html",
+
+  "side_panel": {
+    "default_path": "clean/clean.html"
+  },
 
   "content_scripts": [
     {
@@ -55,6 +73,13 @@
       "matches": ["https://*.aicu.cc/*", "https://aicu.cc/*"],
       "js": ["src/aicu-main.js"],
       "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://*.aicu.cc/*", "https://aicu.cc/*"],
+      "js": ["src/aicu-auto.js"],
+      "run_at": "document_idle",
       "world": "MAIN",
       "all_frames": false
     }

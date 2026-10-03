@@ -9,7 +9,8 @@
 
 import {
   getSettings, getIndex, setIndex, ensureFolder, findFolder, buildTitle,
-  parseCommentUrl, isBiliUrl, listBookmarks, listComments, mergeAicuItems, K_SETTINGS
+  parseCommentUrl, isBiliUrl, listBookmarks, listComments, mergeAicuItems,
+  getAicuStore, K_SETTINGS
 } from './shared.js';
 
 /* ------------------------------------------------------------------ 记录 */
@@ -282,20 +283,26 @@ async function handleDeleted(payload) {
 /* ------------------------------------------------------------------ 角标 */
 
 /**
- * 角标 = 「已删除」归档里还有几条没清空。
- * 也就是：删一条评论 +1，在面板里清空归档后归零。
- * 只统计真正的评论链接，你手动塞进那个目录的别的书签不算数。
+ * 角标 = **待处理总数** = 待删书签 + aicu 导入里还没处理的（按 rpid 去重，两边可能指着同一条）。
+ *
+ * v1.0.x 的角标数的是「已删除、但还没清空记录」的条数 —— 发评论不涨、删评论才涨，
+ * 反直觉到 README 得反复解释。现在改成「还有多少条等着你处理」。
  */
 async function updateBadge() {
   try {
     const settings = await getSettings();
-    const folderId = await findFolder(settings.folderDeleted);
 
-    let count = 0;
-    if (folderId) {
-      const list = await listComments(folderId);
-      count = list.length;
+    const rpids = new Set();
+    const activeId = await findFolder(settings.folderActive);
+    if (activeId) {
+      for (const b of await listComments(activeId)) rpids.add(b.parsed.rpid);
     }
+
+    const aicu = await getAicuStore();
+    const aicuN = Object.keys(aicu.items).length;
+    for (const rpid of Object.keys(aicu.items)) rpids.add(rpid);
+
+    const count = rpids.size;
 
     await chrome.action.setBadgeBackgroundColor({ color: '#fb7299' });
     await chrome.action.setBadgeText({
@@ -303,8 +310,8 @@ async function updateBadge() {
     });
     await chrome.action.setTitle({
       title: count > 0
-        ? `B站评论管家 · 已删除 ${count} 条，待清空归档`
-        : 'B站评论管家 · 归档是空的'
+        ? `B站评论管家 · 待处理 ${count} 条` + (aicuN ? `（其中 aicu 导入 ${aicuN} 条）` : '')
+        : 'B站评论管家 · 没有待处理的评论'
     });
   } catch (e) {
     // 角标失败不影响主流程

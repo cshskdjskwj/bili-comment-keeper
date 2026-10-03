@@ -37,24 +37,6 @@
     </div>
 
     <div class="field">
-      <label>外层文件夹名</label>
-      <input type="text" id="containerFolder" maxlength="40">
-      <span class="desc">两个评论目录都装进它里面；留空则直接放在上面选的位置下</span>
-    </div>
-
-    <div class="field">
-      <label>存活评论目录名</label>
-      <input type="text" id="folderActive" maxlength="40">
-      <span class="desc">保存在外层文件夹里面</span>
-    </div>
-
-    <div class="field">
-      <label>已删除评论目录名</label>
-      <input type="text" id="folderDeleted" maxlength="40">
-      <span class="desc">删除成功后，书签会原样移动到这里</span>
-    </div>
-
-    <div class="field">
       <label>标题里带评论正文</label>
       <label class="switch"><input type="checkbox" id="recordContent"><span></span></label>
       <span class="desc">形如「[2026-01-30 12:34] BV1xx411c7mD · 哈哈哈哈这个太好笑了」</span>
@@ -68,12 +50,35 @@
 
     <div class="field">
       <label>删除间隔（毫秒）</label>
-      <input type="number" id="minDelay" min="300" step="100" style="width:110px">
+      <input type="number" id="minDelay" min="300" step="100" style="width:100px">
       <span class="desc">~</span>
-      <input type="number" id="maxDelay" min="300" step="100" style="width:110px">
+      <input type="number" id="maxDelay" min="300" step="100" style="width:100px">
       <span class="desc">每条之间随机等待，太快容易触发风控（-509）</span>
     </div>
   </div>
+
+  <details class="advanced">
+    <summary>高级：改书签目录名</summary>
+    <div class="form">
+      <div class="field">
+        <label>外层文件夹名</label>
+        <input type="text" id="containerFolder" maxlength="40">
+        <span class="desc">两个评论目录都装进它里面；留空则直接放在上面选的位置下</span>
+      </div>
+
+      <div class="field">
+        <label>存活评论目录名</label>
+        <input type="text" id="folderActive" maxlength="40">
+        <span class="desc">保存在外层文件夹里面</span>
+      </div>
+
+      <div class="field">
+        <label>已删除评论目录名</label>
+        <input type="text" id="folderDeleted" maxlength="40">
+        <span class="desc">删除成功后，书签会原样移动到这里</span>
+      </div>
+    </div>
+  </details>
 
   <section class="bar" style="margin-top:16px">
     <button id="btn-save" class="btn primary">保存设置</button>

@@ -32,6 +32,11 @@ window.addEventListener('message', function (ev) {
       sendToExtension({ type: 'AICU_REPLIES', payload: d.payload });
       return;
     }
+    if (d.__bcAicuAuto && typeof d.__bcAicuAuto === 'object') {
+      // 自动翻页抓取的进度/结束事件
+      sendToExtension({ type: 'AICU_AUTOPAGE', payload: d.__bcAicuAuto });
+      return;
+    }
     if (d.__bcDeleterResult && typeof d.__bcDeleterResult === 'object') {
       var r = d.__bcDeleterResult;
       sendToExtension({
@@ -46,3 +51,16 @@ window.addEventListener('message', function (ev) {
     // 页面脚本可能伪造消息，出错就丢弃
   }
 }, false);
+
+/* aicu.cc 专用：把清除面板发来的「自动翻页」指令转交给主世界的 aicu-auto.js。
+ * 主世界读不到 chrome.* API，所以这条反向通道只能由隔离世界来搭。 */
+try {
+  if (/(^|\.)aicu\.cc$/.test(location.hostname)) {
+    chrome.runtime.onMessage.addListener(function (msg) {
+      if (!msg || msg.type !== 'AICU_AUTOPAGE_CMD') return;
+      try {
+        window.postMessage({ __bcAicuCmd: msg.payload }, '*');
+      } catch (e) { /* 忽略 */ }
+    });
+  }
+} catch (e) { /* 忽略 */ }

@@ -180,6 +180,50 @@ test('clean.js / popup.js / options.js 只 import 共享模块里真实存在的
   console.log(`      [数据] src/shared.js 共导出 ${sharedExports.size} 个符号`);
 });
 
+test('HTML 里用到的 class 都在 ui.css 里有定义', () => {
+  // 重做样式时最容易漏的就是这个：HTML 改了类名、CSS 没跟上，
+  // 页面不报错、也不影响测试，只是那块元素悄悄失去样式。
+  const css = readFileSync(join(ROOT, 'src/ui.css'), 'utf8');
+  const problems = [];
+  let checked = 0;
+
+  for (const file of htmlFiles) {
+    const src = readFileSync(file, 'utf8');
+    for (const m of src.matchAll(/class="([^"]+)"/g)) {
+      for (const cls of m[1].split(/\s+/).filter(Boolean)) {
+        checked++;
+        const esc = cls.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        // 后面不能再接标识符字符，否则 .btn 会被 .btn-mini 这类规则误判为已定义
+        if (!new RegExp('\\.' + esc + '(?![\\w-])').test(css)) {
+          problems.push(`${rel(file)} 用了 .${cls}，但 src/ui.css 里没有定义`);
+        }
+      }
+    }
+  }
+
+  assert.equal(problems.length, 0, `有 ${problems.length} 个 class 没有样式：\n      ${problems.join('\n      ')}`);
+  console.log(`      [数据] 核对了 ${checked} 处 class 引用`);
+});
+
+test('manifest.json 里点名的每个文件都存在（含图标与侧边栏页面）', () => {
+  // CI 里那一步只看了 background / popup / options / content_scripts，
+  // 漏掉图标的话扩展会在 chrome://extensions 直接报错，但谁都不会想到去查 manifest 的 icons。
+  const m = JSON.parse(readFileSync(join(ROOT, 'manifest.json'), 'utf8'));
+
+  const named = new Set();
+  if (m.background?.service_worker) named.add(m.background.service_worker);
+  if (m.action?.default_popup) named.add(m.action.default_popup);
+  if (m.options_page) named.add(m.options_page);
+  if (m.side_panel?.default_path) named.add(m.side_panel.default_path);
+  for (const p of Object.values(m.icons || {})) named.add(p);
+  for (const p of Object.values(m.action?.default_icon || {})) named.add(p);
+  for (const cs of m.content_scripts || []) for (const j of cs.js || []) named.add(j);
+
+  const missing = [...named].filter(f => !existsSync(join(ROOT, f)));
+  assert.equal(missing.length, 0, `manifest 引用了不存在的文件：${missing.join(', ')}`);
+  console.log(`      [数据] manifest 点名了 ${named.size} 个文件，全都在`);
+});
+
 /* ---------------------------------------------------------------- 汇总 */
 
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项\n`);

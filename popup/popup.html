@@ -2,14 +2,14 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <title>B站评论管家</title>
+  <title>评论管家</title>
   <link rel="stylesheet" href="../src/ui.css">
 </head>
 <body class="popup">
 
   <div class="pop-hd">
     <span class="logo">🎀</span>
-    <h1>B站评论管家</h1>
+    <h1>评论管家</h1>
     <div class="spacer"></div>
     <label class="switch" title="自动记录开关">
       <input type="checkbox" id="enabled">
@@ -21,28 +21,24 @@
     <div class="stats">
       <div class="stat">
         <b id="count">0</b>
-        <span>条评论待清理</span>
+        <span>待处理</span>
       </div>
       <div class="stat">
         <b id="arc-count">0</b>
-        <span>条归档待清空</span>
+        <span>已删记录</span>
       </div>
     </div>
-    <div class="path-line" id="path-line"></div>
-    <div class="path-line" id="aicu-line"></div>
-
-    <div class="recent">
-      <div class="recent-hd">最近记录</div>
-      <div id="recent"></div>
+    <div class="pop-lines">
+      <div class="path-line" id="aicu-line"></div>
+      <div class="path-line" id="state-line"></div>
     </div>
   </div>
 
   <div class="pop-ft">
     <div class="pop-row">
-      <button id="btn-clean" class="btn primary">一键清除</button>
+      <button id="btn-console" class="btn primary">打开控制台</button>
       <button id="btn-settings" class="btn ghost">设置</button>
     </div>
-    <div class="empty" style="padding:0">在 B 站发评论后，链接会自动出现在书签栏的「B站我的评论」里。</div>
   </div>
 
   <script type="module" src="popup.js"></script>

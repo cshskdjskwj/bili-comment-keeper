@@ -298,6 +298,189 @@ await test('全是被删过的条目时不会误报成功条数（added 为 0）
   assert.equal(again.total, 1);
 });
 
+/* ==================================== 第三部分：aicu-auto.js 自动翻页 */
+
+const AICU_AUTO = readFileSync(fileURLToPath(new URL('../src/aicu-auto.js', import.meta.url)), 'utf8');
+
+/**
+ * 造一个假的 aicu 页面：一个「下一页」按钮 + 一个会转发消息的 window。
+ * 按钮的 click 会模拟 aicu 的行为：翻到最后之后把自己变灰，并推一份新数据出来。
+ */
+function makeAutoPage(opts = {}) {
+  const totalClicks = opts.totalClicks === undefined ? 3 : opts.totalClicks;
+  const hasNext = opts.hasNext !== false;
+  const clickPostsData = opts.clickPostsData !== false;
+
+  const reports = [];
+  const listeners = [];
+  let clicks = 0;
+  let vmWindow = null;   // 上下文里的 window（和外面这个 sandbox 引用并不相等）
+
+  const btn = {
+    disabled: !!opts.startDisabled,
+    offsetParent: {},                       // 非 null = 可见
+    classList: { contains: () => false },
+    getAttribute: () => null,
+    click() {
+      clicks++;
+      if (clicks >= totalClicks) btn.disabled = true;
+      if (clickPostsData) setTimeout(() => fire({ __bcAicu: true, payload: { items: [{}] } }), 5);
+    }
+  };
+
+  const buttons = hasNext ? [btn] : [];
+
+  const sandbox = {
+    console, Promise, Number, String, Math, Date, Array, Object, isFinite,
+    setTimeout, clearTimeout,
+    document: { querySelectorAll: () => buttons },
+    location: { origin: 'https://www.aicu.cc', pathname: '/reply', search: '?uid=1' }
+  };
+  sandbox.window = sandbox;
+
+  function fire(data) {
+    // 真实的 window.postMessage 会把 event.source 设成 window 自己。
+    // 在 vm 里 window 是上下文代理对象，跟外面这个 sandbox 引用不相等，
+    // 所以必须用「上下文里的那个 window」当 source，否则会被 ev.source !== window 挡掉。
+    for (const fn of listeners) fn({ source: vmWindow || sandbox, data });
+    if (data && data.__bcAicuAuto) reports.push(data.__bcAicuAuto);
+  }
+
+  sandbox.window.addEventListener = (t, fn) => { if (t === 'message') listeners.push(fn); };
+  sandbox.window.postMessage = fire;
+
+  vm.createContext(sandbox);
+  vmWindow = vm.runInContext('window', sandbox);
+  vm.runInContext(AICU_AUTO, sandbox, { filename: 'aicu-auto.js' });
+
+  return { sandbox, reports, fire, btn, clicks: () => clicks };
+}
+
+async function waitDone(reports, timeoutMs = 8000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    const d = reports.find(r => r.kind === 'done');
+    if (d) return d;
+    await new Promise(r => setTimeout(r, 40));
+  }
+  return null;
+}
+
+/** 起跑：先喂一份初始数据，再发开始指令 */
+async function startAuto(p) {
+  p.fire({ __bcAicu: true, payload: { items: [{}] } });
+  await new Promise(r => setTimeout(r, 20));
+}
+
+console.log('\n— aicu-auto.js 自动翻页 —');
+
+await test('替用户点「下一页」，翻到最后一页就自己停', async () => {
+  const p = makeAutoPage({ totalClicks: 3 });
+  await startAuto(p);
+
+  p.fire({ __bcAicuCmd: { action: 'autopage-start', maxPages: 50, gapMs: 300, waitMs: 1500 } });
+  const done = await waitDone(p.reports);
+
+  assert.ok(done, '应该在超时前结束');
+  assert.match(done.reason, /最后一页/);
+  assert.equal(p.clicks(), 3, `应该点 3 次「下一页」，实际 ${p.clicks()} 次`);
+  assert.ok(p.reports.some(r => r.kind === 'progress' && r.pages > 0), '过程中要回报进度');
+});
+
+await test('按钮已经是灰的（末页）时，一次都不点', async () => {
+  const p = makeAutoPage({ startDisabled: true });
+  await startAuto(p);
+
+  p.fire({ __bcAicuCmd: { action: 'autopage-start', maxPages: 50, gapMs: 300, waitMs: 1500 } });
+  const done = await waitDone(p.reports);
+
+  assert.ok(done);
+  assert.match(done.reason, /最后一页/);
+  assert.equal(p.clicks(), 0, '按钮禁用了就不该再点');
+});
+
+await test('找不到「下一页」（页面结构变了）时安静收场', async () => {
+  const p = makeAutoPage({ hasNext: false });
+  await startAuto(p);
+
+  p.fire({ __bcAicuCmd: { action: 'autopage-start', maxPages: 50, gapMs: 300, waitMs: 1500 } });
+  const done = await waitDone(p.reports);
+
+  assert.ok(done);
+  assert.match(done.reason, /找不到/);
+  assert.equal(p.clicks(), 0);
+});
+
+await test('收到停止指令就停下，并说明是用户停的', async () => {
+  const p = makeAutoPage({ totalClicks: 100 });
+  await startAuto(p);
+
+  p.fire({ __bcAicuCmd: { action: 'autopage-start', maxPages: 500, gapMs: 400, waitMs: 1500 } });
+  await new Promise(r => setTimeout(r, 600));
+  assert.ok(p.clicks() > 0, '应该已经开始翻了');
+
+  p.fire({ __bcAicuCmd: { action: 'autopage-stop' } });
+  const done = await waitDone(p.reports);
+
+  assert.ok(done);
+  assert.match(done.reason, /停止/);
+});
+
+await test('尊重页数上限', async () => {
+  const p = makeAutoPage({ totalClicks: 100 });
+  await startAuto(p);
+
+  p.fire({ __bcAicuCmd: { action: 'autopage-start', maxPages: 2, gapMs: 300, waitMs: 1500 } });
+  const done = await waitDone(p.reports);
+
+  assert.ok(done);
+  assert.match(done.reason, /上限/);
+  assert.equal(p.clicks(), 2);
+});
+
+await test('点了下一页却等不到新数据时说明原因并停下，不无限空转', async () => {
+  const p = makeAutoPage({ totalClicks: 100, clickPostsData: false });
+  await startAuto(p);
+
+  p.fire({ __bcAicuCmd: { action: 'autopage-start', maxPages: 50, gapMs: 300, waitMs: 1500 } });
+  const done = await waitDone(p.reports, 10000);
+
+  assert.ok(done, '应该在等待超时后结束');
+  assert.match(done.reason, /没等到新数据/);
+  assert.equal(p.clicks(), 1, '只该点一次就放弃');
+});
+
+await test('首屏一直没数据（还在排队）时，也会停下并说明', async () => {
+  const p = makeAutoPage({ totalClicks: 3 });
+  // 故意不喂初始数据
+  p.fire({ __bcAicuCmd: { action: 'autopage-start', maxPages: 50, gapMs: 300, firstWaitMs: 1500 } });
+  const done = await waitDone(p.reports, 10000);
+
+  assert.ok(done);
+  assert.match(done.reason, /没等到数据/);
+  assert.equal(p.clicks(), 0, '首屏都没数据就不该开始点');
+});
+
+await test('抓取期间重复发开始指令会被忽略，不会跑成两份', async () => {
+  const p = makeAutoPage({ totalClicks: 100 });
+  await startAuto(p);
+
+  const cmd = { action: 'autopage-start', maxPages: 500, gapMs: 400, waitMs: 1500 };
+  p.fire({ __bcAicuCmd: cmd });
+  await new Promise(r => setTimeout(r, 200));
+  const afterFirst = p.clicks();
+  p.fire({ __bcAicuCmd: cmd });
+  await new Promise(r => setTimeout(r, 600));
+  const afterSecond = p.clicks();
+
+  p.fire({ __bcAicuCmd: { action: 'autopage-stop' } });
+  await waitDone(p.reports, 5000);
+
+  // 两份一起跑的话，点击数会明显翻倍；这里只该按一份的节奏增长
+  const delta = afterSecond - afterFirst;
+  assert.ok(delta <= 4, `重复开始指令不该让翻页速度翻倍（这 600ms 内点了 ${delta} 次）`);
+});
+
 /* ---------------------------------------------------------------- 汇总 */
 
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项\n`);

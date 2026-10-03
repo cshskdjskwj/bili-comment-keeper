@@ -55,8 +55,11 @@ const aidCache = new Map();  // bvid -> aid
 let running = false, stopRequested = false;
 let workerTabId = null, workerCreated = false;
 let settings = null, activeFolderId = null, deletedFolderId = null;
-let indexCache = {}, items = [], stats = { ok: 0, fail: 0 }, purgeTimer = null;
+let indexCache = {}, items = [], stats = { ok: 0, fail: 0, gone: 0 }, purgeTimer = null;
 let indexRefreshDone = false;   // 本轮删除里是否已经重读过索引
+let sourceFilter = 'all';       // 来源筛选：all | bookmark | aicu
+let logAutoOpened = false;      // 出错后日志是否已经自动展开过
+let aicuFoldAutoOpened = false; // aicu 折叠区是否已经自动展开过
 
 chrome.runtime.onMessage.addListener(function (msg) {
   if (!msg) return;
@@ -69,8 +72,24 @@ chrome.runtime.onMessage.addListener(function (msg) {
   }
 
   // 在 aicu.cc 页面又抓到一批历史评论，跟着刷新导入区
+  // （自动翻页时每页都会推一次，节流一下，别把列表反复重绘几百次）
   if (msg.type === 'AICU_UPDATED') {
-    loadAicu().catch(function () {});
+    scheduleAicuRender();
+    return;
+  }
+
+  // 自动翻页抓取的进度 / 结束
+  if (msg.type === 'AICU_AUTOPAGE' && msg.payload) {
+    const p = msg.payload;
+    if (p.kind === 'done') {
+      setAicuAuto(false);
+      setAicuHint('自动抓取结束：' + (p.reason || '已结束') +
+        (p.pages ? `（共翻了 ${p.pages} 页）` : ''), 'warn');
+      loadAicu().catch(function () {});
+    } else if (p.kind === 'progress') {
+      setAicuHint('自动抓取中：' + (p.note || '…') +
+        '　—— 这是替你点 aicu 页面上的「下一页」，不会多发任何请求。', '');
+    }
     return;
   }
 
@@ -95,9 +114,7 @@ async function init() {
   deletedFolderId = await ensureFolder(settings.folderDeleted);
   indexCache = await getIndex();
 
-  $('folders').textContent =
-    `${folderPath(settings, settings.folderActive)}  →  删除后移入：${folderPath(settings, settings.folderDeleted)}`;
-
+  buildFilters();
   bindEvents();
   await reload();
   await loadArchive();
@@ -106,6 +123,18 @@ async function init() {
 
 function bindEvents() {
   $('btn-start').addEventListener('click', start);
+
+  $('btn-settings').addEventListener('click', function () {
+    chrome.runtime.openOptionsPage();
+  });
+
+  // 来源筛选
+  $('filters').addEventListener('click', function (e) {
+    const btn = e.target.closest('.chip');
+    if (!btn) return;
+    sourceFilter = btn.dataset.src || 'all';
+    render();
+  });
 
   $('btn-stop').addEventListener('click', function () {
     if (!running) return;
@@ -130,7 +159,9 @@ function bindEvents() {
   });
 
   $('check-all').addEventListener('change', function (e) {
-    items.forEach(i => { if (i.status !== 'done') i.checked = e.target.checked; });
+    // 只作用于当前筛选出来的那批，别把筛掉的也一起改了
+    const vis = new Set(visibleItems().map(i => i.id));
+    items.forEach(i => { if (vis.has(i.id) && i.status !== 'done') i.checked = e.target.checked; });
     render();
   });
 
@@ -142,6 +173,11 @@ function bindEvents() {
   });
 
   // aicu.cc 导入区
+  $('btn-aicu-auto').addEventListener('click', function () {
+    startAutoPage().catch(e => setAicuHint('启动失败：' + ((e && e.message) || e), 'bad'));
+  });
+  $('btn-aicu-autostop').addEventListener('click', stopAutoPage);
+
   $('btn-aicu-merge').addEventListener('click', function () {
     if (running) return;
     mergeAicu().catch(e => setAicuHint('加入失败：' + ((e && e.message) || e), 'bad'));
@@ -164,7 +200,7 @@ function bindEvents() {
   $('btn-purge-no').addEventListener('click', function () { setPurgeConfirm(false); });
 }
 
-/* --------------------------------------------------------- 已删除归档的展示 */
+/* ------------------------------------------- 已删除记录（本地书签账本）的展示 */
 
 async function loadArchive() {
   if (!deletedFolderId || !settings) return;   // 初始化还没走完
@@ -172,7 +208,8 @@ async function loadArchive() {
   const list = await listBookmarks(deletedFolderId);
   list.sort((a, b) => String(b.title || '').localeCompare(String(a.title || '')));
   $('arc-count').textContent = String(list.length);
-  $('arc-path').textContent = folderPath(settings, settings.folderDeleted);
+  $('arc-path').textContent =
+    `待删目录：${folderPath(settings, settings.folderActive)}　|　归档目录：${folderPath(settings, settings.folderDeleted)}`;
 
   $('arc-list').innerHTML = list.length
     ? list.map(b => `<div class="arc-item" title="${escapeHtml(b.title)}">• <a href="${escapeHtml(b.url)}" target="_blank">${escapeHtml(b.title)}</a></div>`).join('')
@@ -186,6 +223,9 @@ async function loadArchive() {
  */
 
 const AICU_RENDER_LIMIT = 200;
+
+let autoRunning = false;        // 自动翻页是否正在进行
+let aicuRenderTimer = null;     // 导入区重绘节流
 
 function setAicuHint(text, kind) {
   const el = $('aicu-hint');
@@ -230,13 +270,21 @@ async function loadAicu() {
   const merged = items.filter(i => i.source === 'aicu').length;
 
   $('aicu-count').textContent = String(list.length);
+
+  // 第一次看到有待导入的条目时自动展开；之后尊重用户的手动开合
+  if (!aicuFoldAutoOpened && list.length) {
+    aicuFoldAutoOpened = true;
+    const fold = $('fold-aicu');
+    if (fold) fold.open = true;
+  }
   $('aicu-uid').textContent = store.uid
     ? ('UID ' + store.uid + (store.total ? ' · 站上记着 ' + store.total + ' 条' : ''))
     : '';
 
   const notes = [];
   if (!list.length) {
-    notes.push('还没有导入。打开 https://www.aicu.cc/reply?uid=你的UID 翻几页，本扩展会自动把列表读进来。');
+    notes.push('还没有导入。打开 https://www.aicu.cc/reply?uid=你的UID 翻几页，' +
+      '或者直接点右边的「自动翻页抓取」让扩展替你翻。');
   } else {
     notes.push(`共 ${list.length} 条，其中 ${merged} 条已加入待删列表。`);
     notes.push('提醒：aicu.cc 只是索引，删除发生在 B 站；已删评论也可能仍留在它的存档里。');
@@ -262,7 +310,7 @@ async function loadAicu() {
     : '<div class="empty" style="padding:10px 13px">还没有从 aicu.cc 导入任何评论。</div>';
 }
 
-/** 收集「已删除」归档里已有的 rpid —— 这些已经确认删过，别再浪费一次接口调用 */
+/** 收集「已删除记录」里已有的 rpid —— 这些已经确认删过，别再浪费一次接口调用 */
 async function archivedRpids() {
   const set = new Set();
   if (!deletedFolderId) return set;
@@ -300,10 +348,106 @@ async function mergeAicu() {
   render();
   const parts = [];
   if (skipped) parts.push(`${skipped} 条已在列表里`);
-  if (alreadyGone) parts.push(`${alreadyGone} 条已在「已删除」归档里，跳过`);
+  if (alreadyGone) parts.push(`${alreadyGone} 条已在「已删除记录」里，跳过`);
   const tail = parts.length ? `（${parts.join('，')}）` : '';
   setAicuHint(`已加入 ${added} 条${tail}。勾选后点上面的「开始删除」即可。`, added ? '' : 'warn');
   await loadAicu();
+}
+
+/* -------------------------------------------- aicu.cc 自动翻页抓取 */
+
+function scheduleAicuRender() {
+  if (aicuRenderTimer) return;
+  aicuRenderTimer = setTimeout(function () {
+    aicuRenderTimer = null;
+    loadAicu().catch(function () {});
+  }, 1500);
+}
+
+function setAicuAuto(on) {
+  autoRunning = !!on;
+  $('btn-aicu-auto').classList.toggle('hide', !!on);
+  $('btn-aicu-autostop').classList.toggle('hide', !on);
+}
+
+/** 找一个已打开的 aicu.cc 标签页；没有就按已知 UID 开一个后台标签页 */
+async function findAicuTab() {
+  const tabs = await chrome.tabs.query({ url: ['https://*.aicu.cc/*', 'https://aicu.cc/*'] });
+  const usable = tabs.find(t => t.id !== undefined && t.id !== null && !t.discarded);
+  if (usable) return usable;
+
+  const store = await getAicuStore();
+  if (!store.uid) return null;
+
+  const tab = await chrome.tabs.create({
+    url: 'https://www.aicu.cc/reply?uid=' + encodeURIComponent(store.uid),
+    active: false
+  });
+  await waitTabComplete(tab.id, 25000);
+  return tab;
+}
+
+/** 内容脚本可能还没注入（刚打开的页面），重试几次再放弃 */
+async function sendToAicuTab(tabId, payload) {
+  for (let i = 0; i < 6; i++) {
+    try {
+      await chrome.tabs.sendMessage(tabId, { type: 'AICU_AUTOPAGE_CMD', payload: payload });
+      return true;
+    } catch (e) {
+      await sleep(700);
+    }
+  }
+  return false;
+}
+
+async function startAutoPage() {
+  if (autoRunning) return;
+  if (running) { setAicuHint('正在删评论，等这一轮结束再抓取。', 'warn'); return; }
+
+  let tab = null;
+  try {
+    tab = await findAicuTab();
+  } catch (e) {
+    setAicuHint('打开 aicu.cc 页面失败：' + ((e && e.message) || e), 'bad');
+    return;
+  }
+
+  if (!tab) {
+    setAicuHint('没找到已打开的 aicu.cc 页面，也还不知道你的 UID。' +
+      '请先手动打开 https://www.aicu.cc/reply?uid=你的UID 并翻一下，再回来点这个按钮。', 'warn');
+    return;
+  }
+
+  setAicuAuto(true);
+  setAicuHint('正在让 aicu.cc 页面自动翻页……（就是替你点页面上的「下一页」，不会多发任何请求）', '');
+
+  const ok = await sendToAicuTab(tab.id, { action: 'autopage-start', maxPages: 300, gapMs: 1200 });
+  if (!ok) {
+    setAicuAuto(false);
+    setAicuHint('联系不上 aicu 页面里的脚本。把那个页面刷新一下（F5）再试。', 'bad');
+  }
+}
+
+function stopAutoPage() {
+  if (!autoRunning) return;
+  setAicuHint('正在停止……当前这一页处理完就停。', 'warn');
+
+  chrome.tabs.query({ url: ['https://*.aicu.cc/*', 'https://aicu.cc/*'] }).then(function (tabs) {
+    for (const t of tabs) {
+      if (t.id === undefined || t.id === null) continue;
+      chrome.tabs.sendMessage(t.id, { type: 'AICU_AUTOPAGE_CMD', payload: { action: 'autopage-stop' } })
+        .catch(function () { /* 页面没了就算了 */ });
+    }
+  }).catch(function () { /* 忽略 */ });
+
+  // 万一页面已经关了、回话回不来，别让按钮永远卡在「停止抓取」
+  setTimeout(function () {
+    if (autoRunning) {
+      setAicuAuto(false);
+      setAicuHint('已停止（没等到页面回话，直接放开了）。导入到的东西都已经存下来了。', 'warn');
+      loadAicu().catch(function () {});
+    }
+  }, 8000);
 }
 
 function setPurgeConfirm(on) {
@@ -318,7 +462,7 @@ async function purgeArchive() {
   if (!deletedFolderId) return;
 
   const children = await chrome.bookmarks.getChildren(deletedFolderId).catch(function () { return []; });
-  if (!children.length) { setHint('「已删除」归档本来就是空的。', 'warn'); return; }
+  if (!children.length) { setHint('「已删除记录」本来就是空的。', 'warn'); return; }
 
   $('btn-purge').disabled = true;
   let removed = 0;
@@ -337,7 +481,7 @@ async function purgeArchive() {
   await refreshBadge();
   $('btn-purge').disabled = false;
 
-  log(`🧹 已清空「已删除」归档，共移除 ${removed} 条书签`);
+  log(`🧹 已清空「已删除记录」，共移除 ${removed} 条书签`);
   setHint(`已清空「${folderPath(settings, settings.folderDeleted)}」，移除 ${removed} 条书签。此操作不可恢复。`, '');
 }
 
@@ -353,7 +497,7 @@ async function reload() {
     if (!parsed) { skipped++; continue; }
     const old = items.find(i => i.id === bm.id);
     next.push({
-      id: bm.id, title: bm.title, url: bm.url, parsed,
+      id: bm.id, source: 'bookmark', title: bm.title, url: bm.url, parsed,
       checked: old ? (old.status === 'done' ? false : old.checked) : true,
       status: old ? old.status : 'idle',
       note: old ? old.note : ''
@@ -363,7 +507,7 @@ async function reload() {
   // 书签列表重建时，把 aicu 导入的条目原样保留（它们没有书签）
   const aicu = items.filter(i => i.source === 'aicu');
   items = next.concat(aicu);
-  stats = { ok: 0, fail: 0 };   // 刷新过列表，「本次成功/失败」不该再显示上一轮的旧数字
+  stats = { ok: 0, fail: 0, gone: 0 };   // 刷新过列表，「本次成功/失败」不该再显示上一轮的旧数字
   render();
   if (skipped > 0) setHint(`目录里有 ${skipped} 条不是评论链接的书签，已自动跳过（不会被删除）。`, 'warn');
 }
@@ -374,23 +518,63 @@ function stText(it) {
   return it.status === 'working' ? '删除中…' : '';
 }
 
+/** 当前来源筛选下应该显示的条目 */
+function visibleItems() {
+  if (sourceFilter === 'all') return items;
+  const wantAicu = sourceFilter === 'aicu';
+  return items.filter(i => (i.source === 'aicu') === wantAicu);
+}
+
+const FILTER_LABEL = { all: '全部', bookmark: '书签记录', aicu: 'aicu 导入' };
+
+/** 筛选栏只在初始化时建一次，之后只更新数字，避免每删一条都重建 DOM */
+function buildFilters() {
+  $('filters').innerHTML = ['all', 'bookmark', 'aicu'].map(k =>
+    `<button class="chip" data-src="${k}">${FILTER_LABEL[k]} <b>0</b></button>`
+  ).join('');
+}
+
+function renderFilters() {
+  const counts = { all: 0, bookmark: 0, aicu: 0 };
+  for (const i of items) {
+    if (i.status === 'done') continue;
+    counts.all++;
+    counts[i.source === 'aicu' ? 'aicu' : 'bookmark']++;
+  }
+  for (const btn of $('filters').querySelectorAll('.chip')) {
+    const k = btn.dataset.src;
+    btn.querySelector('b').textContent = counts[k];
+    btn.classList.toggle('on', k === sourceFilter);
+  }
+}
+
 function rowHtml(it) {
   const cls = STATE_CLS[it.status] || '';
   const kind = it.parsed.isSecondary ? '楼中楼' : '一级评论';
+  const tag = it.source === 'aicu'
+    ? '<i class="tag aicu">aicu</i>'
+    : '<i class="tag">书签</i>';
   return `<div class="row ${it.status}" data-id="${it.id}">
     <input type="checkbox" class="ck" ${it.checked && it.status !== 'done' ? 'checked' : ''} ${it.status === 'done' ? 'disabled' : ''}>
     <div class="row-main">
-      <div class="row-title" title="${escapeHtml(it.title)}">${escapeHtml(it.title)}</div>
+      <div class="row-title" title="${escapeHtml(it.title)}">${tag}${escapeHtml(it.title)}</div>
       <div class="row-sub">rpid ${escapeHtml(it.parsed.rpid)} · ${escapeHtml(sourceLabel(it.parsed.pageUrl))} · ${kind}</div>
     </div>
     <div class="row-state ${cls}">${escapeHtml(stText(it))}</div>
   </div>`;
 }
 
+function emptyText() {
+  if (items.length && !visibleItems().length) return '这个来源下没有待处理的条目。';
+  if (items.length) return '都处理完了 🎉';
+  return '还没有记录。在 B 站发一条评论试试，或者从下面的 aicu.cc 导入历史评论。';
+}
+
 function render() {
-  $('list').innerHTML = items.length
-    ? items.map(rowHtml).join('')
-    : '<div class="empty" style="padding:18px">这个目录是空的～先去 B 站发一条评论吧 🎀</div>';
+  const list = visibleItems();
+  $('list').innerHTML = list.length
+    ? list.map(rowHtml).join('')
+    : `<div class="empty" style="padding:18px">${escapeHtml(emptyText())}</div>`;
   syncCounts();
 }
 
@@ -409,20 +593,29 @@ function renderRow(it) {
   st.textContent = stText(it);
 }
 
-/** 一次算清所有计数：顶部四张卡 + 勾选数 + 按钮文案 */
+/** 一次算清所有计数：概览那一行 + 筛选栏 + 勾选数 + 按钮文案 */
 function syncCounts() {
   const left = items.filter(i => i.status !== 'done');
   const sel = left.filter(i => i.checked).length;
-  $('stat-total').textContent = sel;
+  $('stat-pending').textContent = left.length;
   $('stat-ok').textContent = stats.ok;
   $('stat-fail').textContent = stats.fail;
-  $('stat-left').textContent = left.length;
-  $('sel-count').textContent = `已勾选 ${sel} 条 / 共 ${items.length} 条`;
-  $('btn-start').textContent = sel ? `开始删除（${sel} 条）` : '开始删除';
+  $('stat-gone').textContent = stats.gone;
+  $('sel-count').textContent = sel === left.length
+    ? `待处理 ${left.length} 条`
+    : `已勾选 ${sel} / ${left.length} 条`;
+  $('btn-start').textContent = (sel && sel !== left.length) ? `删除评论（${sel} 条）` : '删除评论';
+  renderFilters();
 }
 
 function updateProgress(done, total) {
   $('progress-inner').style.width = (total ? Math.round(done / total * 100) : 0) + '%';
+}
+
+/** 顶部那行「预计还要多久」 */
+function setEta(text) {
+  const el = $('eta');
+  if (el) el.textContent = text || '';
 }
 
 function setHint(text, kind) {
@@ -437,12 +630,26 @@ function log(line) {
   el.scrollTop = el.scrollHeight;
 }
 
+/** 失败时用的日志：顺手把日志区展开，别让它埋在折叠里没人看见 */
+function logError(line) {
+  log(line);
+  if (logAutoOpened) return;
+  logAutoOpened = true;
+  const fold = $('fold-log');
+  if (fold) fold.open = true;
+}
+
 function setUi(isRunning) {
   $('btn-start').disabled = isRunning;
   $('btn-stop').disabled = !isRunning;
   $('btn-reload').disabled = isRunning;
   $('btn-retry').disabled = isRunning;
   $('btn-purge').disabled = isRunning;
+  // 跑删除的时候别让用户同时去点 aicu 抓取/合并，两件事会互相干扰
+  for (const id of ['btn-aicu-auto', 'btn-aicu-merge', 'btn-aicu-clear']) {
+    const el = $(id);
+    if (el) el.disabled = isRunning;
+  }
   if (isRunning) setPurgeConfirm(false);
 }
 
@@ -625,7 +832,7 @@ async function archive(it) {
   } catch (e) {
     if (await isArchived()) return '';
     const m = '删除成功，但书签移动失败：' + ((e && e.message) || e);
-    log('  ！' + m);
+    logError('  ！' + m);
     return m;
   }
 }
@@ -670,12 +877,13 @@ async function start() {
   running = true;
   stopRequested = false;
   indexRefreshDone = false;
-  stats = { ok: 0, fail: 0 };
+  stats = { ok: 0, fail: 0, gone: 0 };
   setUi(true);
   syncCounts();
   updateProgress(0, targets.length);
   $('log').textContent = '';
-  setHint('正在删除…请保持此页面开着。删除期间会复用一个 bilibili 标签页发送请求。', '');
+  setHint('正在删除…这个面板别关。删除期间会复用一个 bilibili 标签页发请求。', '');
+  setEta('');
 
   try {
     const tabId = await acquireWorkerTab();
@@ -689,7 +897,6 @@ async function start() {
   }
 
   let aborted = false;
-  let gone = 0;                    // 其中 B 站上早就没有了的（aicu 导入里占大多数）
   const deletedRpids = [];         // 删成功的 rpid，最后交回后台清索引
   const deletedAicuRpids = [];     // 其中来自 aicu 导入的，要从导入清单里移除
 
@@ -697,6 +904,7 @@ async function start() {
   // 所以先把预计耗时说清楚，别让人以为卡住了。
   const avgDelay = (Number(settings.minDelay) + Number(settings.maxDelay)) / 2;
   const estMin = Math.max(1, Math.round(targets.length * avgDelay / 60000));
+  setEta(`预计约 ${estMin} 分钟`);
   log(`本次 ${targets.length} 条，每条之间等 ${settings.minDelay}~${settings.maxDelay} 毫秒，预计约 ${estMin} 分钟。`);
   log('中途可以点「停止」：已经处理过的会记账，下次不会重复处理。');
 
@@ -715,7 +923,7 @@ async function start() {
       it.status = 'failed';
       it.note = t.error;
       stats.fail++;
-      log('✗ ' + label(it) + ' → ' + t.error);
+      logError('✗ ' + label(it) + ' → ' + t.error);
     } else {
       r = await attemptDelete(t);
 
@@ -731,7 +939,7 @@ async function start() {
         if (r.ok) {
           it.note = moveErr || '已删除';
         } else {
-          gone++;
+          stats.gone++;
           it.note = it.source === 'aicu'
             ? 'B 站上已经没有这条了'
             : (moveErr || '本来就不存在（已归档）');
@@ -745,7 +953,7 @@ async function start() {
         it.status = 'failed';
         it.note = explainCode(r.code, r.message);
         stats.fail++;
-        log('✗ ' + label(it) + ' 删除失败：code=' + r.code + ' ' + (r.message || ''));
+        logError('✗ ' + label(it) + ' 删除失败：code=' + r.code + ' ' + (r.message || ''));
       }
     }
 
@@ -757,6 +965,12 @@ async function start() {
       setHint('登录态异常（' + explainCode(r.code) + '），已自动停止。请重新登录 B 站后再来一次。', 'bad');
       aborted = true;
       break;
+    }
+    if (i % 10 === 0) {
+      const leftMin = Math.round((targets.length - i - 1) * avgDelay / 60000);
+      setEta(leftMin > 0
+        ? `还剩约 ${leftMin} 分钟（${i + 1}/${targets.length}）`
+        : `${i + 1}/${targets.length}`);
     }
     if (!stopRequested && i < targets.length - 1) await sleep(randInt(settings.minDelay, settings.maxDelay));
   }
@@ -775,17 +989,18 @@ async function start() {
   running = false;
   setUi(false);
   syncCounts();
+  setEta('');
   await loadArchive();
   await loadAicu();
 
   const left = items.filter(i => i.status !== 'done').length;
-  const goneText = gone ? `，其中 ${gone} 条 B 站上早就没有了` : '';
+  const goneText = stats.gone ? `，其中 ${stats.gone} 条 B 站上早就没有了` : '';
   if (stats.fail === 0 && !aborted) {
     setHint(`全部搞定：本次处理 ${stats.ok} 条${goneText}。书签类已归档，aicu 导入的已从清单移除。列表里还剩 ${left} 条。`, '');
   } else {
     setHint(`本次成功 ${stats.ok} 条${goneText}，失败 ${stats.fail} 条。失败的书签仍然留在「${folderPath(settings, settings.folderActive)}」里，日志里有原因，修好后可点「重试失败项」。`, 'warn');
   }
-  log(`—— 结束：成功 ${stats.ok}（其中早就没有的 ${gone} 条），失败 ${stats.fail}，列表剩余 ${left} ——`);
+  log(`—— 结束：成功 ${stats.ok}（其中早就没有的 ${stats.gone} 条），失败 ${stats.fail}，列表剩余 ${left} ——`);
 }
 
 /** 删一条，并把「连标签页都拿不到」这种情况收敛成一条失败原因，不让它掀翻整个循环 */

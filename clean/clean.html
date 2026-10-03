@@ -2,74 +2,92 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <title>一键清除 · B站评论管家</title>
+  <title>评论管家 · 控制台</title>
   <link rel="stylesheet" href="../src/ui.css">
 </head>
-<body class="page">
+<body class="console">
 
-  <header class="hd">
-    <div class="hd-t">
-      <span class="logo">🧹</span>
-      <h1>一键清除</h1>
-    </div>
-    <div class="hd-s" id="folders"></div>
+  <header class="topbar">
+    <span class="logo">🧹</span>
+    <h1>评论管家</h1>
+    <span class="spacer"></span>
+    <button id="btn-settings" class="btn mini ghost" title="打开设置">设置</button>
   </header>
 
-  <section class="cards">
-    <div class="card"><b id="stat-total">0</b><span>勾选待删</span></div>
-    <div class="card ok"><b id="stat-ok">0</b><span>本次成功</span></div>
-    <div class="card bad"><b id="stat-fail">0</b><span>本次失败</span></div>
-    <div class="card"><b id="stat-left">0</b><span>目录剩余</span></div>
+  <!-- 概览：所有数字压成一行，把地方留给列表 -->
+  <section class="overview">
+    <div class="metrics">
+      <span class="metric"><b id="stat-pending">0</b><i>待处理</i></span>
+      <span class="metric ok"><b id="stat-ok">0</b><i>已删除</i></span>
+      <span class="metric bad"><b id="stat-fail">0</b><i>失败</i></span>
+      <span class="metric mute"><b id="stat-gone">0</b><i>早就没了</i></span>
+    </div>
+    <div class="progress"><i id="progress-inner"></i></div>
+    <div class="eta" id="eta"></div>
   </section>
 
-  <section class="bar">
-    <button id="btn-start" class="btn primary">开始删除</button>
+  <!-- 主操作 -->
+  <section class="actions">
+    <button id="btn-start" class="btn primary">删除评论</button>
     <button id="btn-stop" class="btn danger" disabled>停止</button>
-    <button id="btn-retry" class="btn ghost">重试失败项</button>
+    <button id="btn-retry" class="btn ghost">重试失败</button>
     <button id="btn-reload" class="btn ghost">刷新列表</button>
   </section>
 
-  <div class="progress"><i id="progress-inner"></i></div>
-  <div id="hint" class="hint">删除会逐条调用 B 站官方删除接口（每条之间有 1.5~4 秒随机间隔，避免触发风控）。删除成功后，对应书签会从「B站我的评论」移动到「B站已删除评论」，链接原样保留。</div>
+  <div id="hint" class="hint">「删除评论」删的是 <b>B 站上的评论</b>；删成功的记录会挪进下面的「已删除记录」，链接原样保留，方便你事后核对。</div>
 
+  <!-- 来源筛选：这是新版的重心 —— 记录来自两个地方 -->
+  <nav class="filters" id="filters"></nav>
+
+  <!-- 主列表 -->
   <section class="list-wrap">
     <div class="list-hd">
-      <label><input type="checkbox" id="check-all" checked> 全选</label>
-      <span id="sel-count"></span>
+      <span id="sel-count">还没有记录</span>
+      <span class="spacer"></span>
+      <label class="mini-check"><input type="checkbox" id="check-all" checked> 全选</label>
     </div>
     <div id="list" class="list"></div>
   </section>
 
-  <section class="list-wrap aicu">
-    <div class="list-hd">
-      <span>aicu.cc 导入的历史评论 · <b id="aicu-count">0</b> 条</span>
-      <span class="arc-path" id="aicu-uid"></span>
-      <span class="spacer"></span>
-      <button id="btn-aicu-merge" class="btn mini">全部加入待删列表</button>
-      <button id="btn-aicu-clear" class="btn mini ghost">清空导入</button>
+  <!-- aicu.cc 导入：默认收起，有待处理时才自动展开 -->
+  <details class="fold" id="fold-aicu">
+    <summary>aicu.cc 导入的历史评论 · <b id="aicu-count">0</b> 条</summary>
+    <div class="fold-body">
+      <div class="arc-path" id="aicu-uid"></div>
+      <div id="aicu-hint" class="hint"></div>
+      <div class="row-actions">
+        <button id="btn-aicu-auto" class="btn mini">自动翻页抓取</button>
+        <button id="btn-aicu-autostop" class="btn mini danger hide">停止抓取</button>
+        <button id="btn-aicu-merge" class="btn mini">加入待删列表</button>
+        <button id="btn-aicu-clear" class="btn mini ghost">清空导入</button>
+      </div>
+      <div id="aicu-list" class="arc-list"></div>
     </div>
-    <div id="aicu-hint" class="hint"></div>
-    <div id="aicu-list" class="arc-list"></div>
-  </section>
+  </details>
 
-  <section class="list-wrap archive">
-    <div class="list-hd">
-      <span>已删除归档 · <b id="arc-count">0</b> 条</span>
-      <span class="arc-path" id="arc-path"></span>
-      <span class="spacer"></span>
-      <span id="purge-confirm" class="purge-confirm hide">
-        清空后无法恢复
-        <button id="btn-purge-yes" class="btn mini danger">确定清空</button>
-        <button id="btn-purge-no" class="btn mini ghost">取消</button>
-      </span>
-      <button id="btn-purge" class="btn mini danger">一键清空</button>
+  <!-- 已删除记录：它只是"账本"，不再是必做步骤 -->
+  <details class="fold" id="fold-archive">
+    <summary>已删除记录（本地书签账本） · <b id="arc-count">0</b> 条</summary>
+    <div class="fold-body">
+      <div class="arc-path" id="arc-path"></div>
+      <div class="row-actions">
+        <span id="purge-confirm" class="purge-confirm hide">
+          清空后无法恢复
+          <button id="btn-purge-yes" class="btn mini danger">确定清空</button>
+          <button id="btn-purge-no" class="btn mini ghost">取消</button>
+        </span>
+        <button id="btn-purge" class="btn mini ghost">清空本地记录</button>
+      </div>
+      <div id="arc-list" class="arc-list"></div>
     </div>
-    <div id="arc-list" class="arc-list"></div>
-  </section>
+  </details>
 
-  <details class="log-wrap">
+  <!-- 日志：出错时自动展开 -->
+  <details class="fold" id="fold-log">
     <summary>运行日志</summary>
-    <pre id="log"></pre>
+    <div class="fold-body">
+      <pre id="log"></pre>
+    </div>
   </details>
 
   <script type="module" src="clean.js"></script>
