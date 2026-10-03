@@ -76,6 +76,60 @@
   /* ------------------------------------------------ 第二条路：直接读页面 */
 
   /**
+   * 从一张卡片里读正文和时间。
+   *
+   * aicu 用 MUI 渲染：正文是 `MuiTypography-body1`，上面那行小字（日期 + rank）
+   * 是 `MuiTypography-caption`。优先按类名取，取不到再退回按文本猜 ——
+   * 不把话说死，免得 aicu 换个 UI 库就全瞎。
+   */
+  function readCard(card) {
+    var message = '';
+    var ctime = 0;
+
+    var pick = function (sel) {
+      try { return card.querySelector ? card.querySelector(sel) : null; } catch (e) { return null; }
+    };
+
+    var body = pick('.MuiTypography-body1');
+    if (body) message = String(body.textContent || '').trim();
+
+    var cap = pick('.MuiTypography-caption');
+    var capText = cap ? String(cap.textContent || '') : '';
+
+    var parseTime = function (s) {
+      var m = /(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?/.exec(s || '');
+      if (!m) return 0;
+      var t = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)).getTime();
+      return isFinite(t) ? Math.floor(t / 1000) : 0;
+    };
+
+    ctime = parseTime(capText);
+
+    // 兜底：按类名没拿到就翻一遍叶子节点猜
+    if (!message || !ctime) {
+      var nodes = [];
+      try { nodes = card.querySelectorAll ? card.querySelectorAll('*') : []; } catch (e) { nodes = []; }
+      for (var k = 0; k < nodes.length; k++) {
+        var el = nodes[k];
+        if (el.children && el.children.length) continue;      // 只要叶子节点
+        var t = String(el.textContent || '').trim();
+        if (!t) continue;
+        if (!ctime) {
+          var got = parseTime(t);
+          if (got) { ctime = got; continue; }
+        }
+        if (!message && t.length > 1 &&
+            t !== '方式0' && t !== '方式2' && t !== '方式3' &&
+            t.indexOf('爱来自aicu.cc') < 0 && t.indexOf('uid:') !== 0) {
+          message = t;
+        }
+      }
+    }
+
+    return { message: message.slice(0, 200), ctime: ctime };
+  }
+
+  /**
    * 从渲染出来的列表里抠评论。
    *
    * aicu 每条评论都带两个链接（页面上显示成「方式0」「方式2」）：
@@ -104,20 +158,28 @@
       var root = u.searchParams.get('root') || '0';
       if (!/^\d+$/.test(oid) || !isFinite(pageType)) continue;
 
-      // 在同一个卡片里往上找几层，拿带 #reply 的那个链接里的 rpid
-      var rpid = '';
+      // 顺着往上找到「整张卡片」：按钮行的文本只有「方式0方式2」，很短，
+      // 第一个文本明显更长的祖先就是卡片本身（里面有正文和时间）。
       var scope = subs[i].parentElement;
-      for (var hop = 0; hop < 4 && scope && !rpid; hop++) {
-        var hit = null;
-        try { hit = scope.querySelector ? scope.querySelector('a[href*="#reply"]') : null; } catch (e) { hit = null; }
-        if (hit) {
-          var m = /#reply(\d+)/.exec(hit.getAttribute('href') || '');
-          if (m) rpid = m[1];
+      var card = null;
+      var rpid = '';
+      for (var hop = 0; hop < 5 && scope; hop++) {
+        if (!rpid) {
+          var hit = null;
+          try { hit = scope.querySelector ? scope.querySelector('a[href*="#reply"]') : null; } catch (e) { hit = null; }
+          if (hit) {
+            var m = /#reply(\d+)/.exec(hit.getAttribute('href') || '');
+            if (m) rpid = m[1];
+          }
         }
+        if (!card && String(scope.textContent || '').trim().length > 20) card = scope;
+        if (rpid && card) break;
         scope = scope.parentElement;
       }
       if (!rpid || seen[rpid]) continue;
       seen[rpid] = 1;
+
+      var extra = card ? readCard(card) : { message: '', ctime: 0 };
 
       out.push({
         rpid: rpid,
@@ -126,8 +188,8 @@
         root: /^\d+$/.test(root) ? root : '0',
         // 方式2 的 root：一级评论就是它自己，楼中楼才是根评论 id
         rank: (root && root !== rpid) ? 2 : 1,
-        message: '',
-        ctime: 0
+        message: extra.message,
+        ctime: extra.ctime
       });
     }
     return out;

@@ -9,7 +9,8 @@
 import {
   getSettings, getIndex, ensureFolder, parseCommentUrl, listBookmarks,
   sleep, randInt, escapeHtml, explainCode, sourceLabel, fmtTime, folderPath,
-  getAicuStore, listAicuItems, clearAicuStore, removeAicuItems, aicuPageUrl, aicuTypeName
+  getAicuStore, listAicuItems, clearAicuStore, removeAicuItems, markAicuAlive,
+  aicuPageUrl, aicuTypeName
 } from '../src/shared.js';
 
 const $ = id => document.getElementById(id);
@@ -58,6 +59,96 @@ async function mainWorldDelete(arg) {
   } catch (err) {
     const msg = (err && err.name === 'AbortError') ? '请求超时（15 秒）' : '网络错误：' + ((err && err.message) || err);
     return done({ ok: false, code: null, message: msg });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 注入网页主世界执行：**只读地**判断一条评论还在不在（不发任何删除请求）。
+ *
+ * 用的是评论区的读取接口 GET /x/v2/reply/reply?type=&oid=&root=<rpid>：
+ *   还在   → code 0，data.root 有值
+ *   没了   → code 12006「没有该评论」
+ * 这两种返回都用真实数据实测过。
+ *
+ * **楼中楼要特别处理**：把二级评论的 rpid 当 root 去查时，B 站会把它解析到所属的
+ * 根评论、照样返回 code 0 —— 所以光看 code 不够，还得去那条会话的回复列表里
+ * 找它本人在不在。找到了才算活着。
+ *
+ * 拿不准的一律返回 alive=null（宁可留着让后面删一次，也不误杀）。
+ */
+async function mainWorldCheck(arg) {
+  const done = out => {
+    out.requestId = arg.requestId;
+    try {
+      if (!window.__bcDelResults) window.__bcDelResults = {};
+      const keys = Object.keys(window.__bcDelResults);
+      if (keys.length > 200) {
+        for (let i = 0; i < keys.length - 100; i++) delete window.__bcDelResults[keys[i]];
+      }
+      window.__bcDelResults[arg.requestId] = out;
+    } catch (e) { /* 忽略 */ }
+    try { window.postMessage({ __bcDeleterResult: out }, '*'); } catch (e) { /* 忽略 */ }
+    return out;
+  };
+
+  const q = 'type=' + encodeURIComponent(String(arg.type)) +
+    '&oid=' + encodeURIComponent(String(arg.oid));
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+
+  try {
+    const res = await fetch('https://api.bilibili.com/x/v2/reply/reply?' + q +
+      '&root=' + encodeURIComponent(String(arg.rpid)) + '&pn=1&ps=1',
+      { credentials: 'include', signal: ctrl.signal });
+    const json = await res.json().catch(() => null);
+    if (!json) return done({ ok: false, alive: null, code: null, message: '接口返回不是 JSON' });
+
+    if (json.code === 12006) {
+      return done({ ok: true, alive: false, code: 12006, message: json.message || '没有该评论' });
+    }
+    if (json.code !== 0) {
+      // 风控、未登录之类的错误：当"不确定"，绝不误判成已删除
+      return done({ ok: false, alive: null, code: json.code, message: json.message || '' });
+    }
+
+    const root = json.data && json.data.root;
+    if (!root) {
+      return done({ ok: true, alive: false, code: 0, message: '会话还在，但这条评论已经不在了' });
+    }
+
+    // 一级评论：B 站返回的 root 就是它自己
+    if (String(root.rpid) === String(arg.rpid)) {
+      return done({ ok: true, alive: true, code: 0, message: '' });
+    }
+
+    // 楼中楼：B 站把我们解析到了所属的根评论，得去会话里把它本人找出来
+    const rootId = String(root.rpid);
+    for (let pn = 1; pn <= 3; pn++) {
+      const r2 = await fetch('https://api.bilibili.com/x/v2/reply/reply?' + q +
+        '&root=' + encodeURIComponent(rootId) + '&pn=' + pn + '&ps=49',
+        { credentials: 'include', signal: ctrl.signal });
+      const j2 = await r2.json().catch(() => null);
+      if (!j2 || j2.code !== 0) break;
+
+      const list = (j2.data && j2.data.replies) || [];
+      for (let i = 0; i < list.length; i++) {
+        if (String(list[i].rpid) === String(arg.rpid)) {
+          return done({ ok: true, alive: true, code: 0, message: '' });
+        }
+      }
+
+      const count = (j2.data && j2.data.page && j2.data.page.count) || 0;
+      if (pn * 49 >= count) {
+        return done({ ok: true, alive: false, code: 0, message: '会话里已经没有这条了' });
+      }
+    }
+    return done({ ok: false, alive: null, code: 0, message: '这条会话太长，没能确认这一条' });
+  } catch (err) {
+    const msg = (err && err.name === 'AbortError') ? '探测超时' : ('网络错误：' + ((err && err.message) || err));
+    return done({ ok: false, alive: null, code: null, message: msg });
   } finally {
     clearTimeout(timer);
   }
@@ -202,6 +293,14 @@ function bindEvents() {
   });
   $('btn-aicu-autostop').addEventListener('click', stopAutoPage);
 
+  // 只读探测：先问清楚哪些还活着，再决定删什么
+  $('btn-aicu-probe').addEventListener('click', function () {
+    probeAicuAlive().catch(e => {
+      setAicuProbing(false);
+      setAicuHint('探测失败：' + ((e && e.message) || e), 'bad');
+    });
+  });
+
   // 只读当前这一页（不翻页）。这是最重要的逃生口：
   // 页面明明有评论、导入却一直是 0 的时候，点它试试 —— 它直接从渲染结果里抠，
   // 完全不依赖「挂钩页面请求」那条路。
@@ -257,7 +356,16 @@ async function loadArchive() {
 const AICU_RENDER_LIMIT = 200;
 
 let autoRunning = false;        // 自动翻页是否正在进行
+let probing = false;            // 存活探测是否正在进行
+let probeStop = false;          // 探测的停止请求
 let aicuRenderTimer = null;     // 导入区重绘节流
+
+/**
+ * 存活探测每条之间的间隔。
+ * 比删除的 1.5~4 秒短得多 —— 因为探测是**只读 GET**，不是写操作，
+ * 对风控的压力小一个量级。（真被限流了会自动歇 15 秒再继续。）
+ */
+const BC_PROBE_DELAY_MS = 350;
 
 function setAicuHint(text, kind) {
   const el = $('aicu-hint');
@@ -318,7 +426,18 @@ async function loadAicu() {
     notes.push('还没有导入。打开 https://www.aicu.cc/reply?uid=你的UID 之后，' +
       '点「自动翻页抓取」让它替你翻，或者点「读当前页」只把眼前这页捞进来。');
   } else {
+    const aliveN = list.filter(i => i.alive === true).length;
+    const goneN = list.filter(i => i.alive === false).length;
+    const untestedN = list.length - aliveN - goneN;
+
     notes.push(`共 ${list.length} 条，其中 ${merged} 条已加入待删列表。`);
+    if (aliveN || goneN) {
+      notes.push(`存活探测：还在 ${aliveN} 条，已经没了 ${goneN} 条` +
+        (untestedN ? `，还没探过 ${untestedN} 条。` : '。'));
+    } else {
+      notes.push(`${untestedN} 条都还没探测过存活 —— 点「探测存活」可以先筛掉早就删掉的那些，` +
+        '不然要一条条去问 B 站，很慢。');
+    }
     notes.push('提醒：aicu.cc 只是索引，删除发生在 B 站；已删评论也可能仍留在它的存档里。');
   }
   if (store.mixed) {
@@ -367,11 +486,14 @@ async function mergeAicu() {
   for (const i of items) if (i.parsed && i.parsed.rpid) known.add(i.parsed.rpid);
 
   const archived = await archivedRpids();
-  let added = 0, skipped = 0, alreadyGone = 0;
+  let added = 0, skipped = 0, alreadyGone = 0, probedGone = 0, untested = 0;
 
   for (const item of list) {
     if (known.has(item.rpid)) { skipped++; continue; }
+    // 探测过、确认 B 站上已经没有了的，不再放进来 —— 这正是探测的意义
+    if (item.alive === false) { probedGone++; continue; }
     if (archived.has(item.rpid)) { alreadyGone++; continue; }
+    if (item.alive === undefined) untested++;
     items.push(aicuRow(item));
     known.add(item.rpid);
     added++;
@@ -380,9 +502,12 @@ async function mergeAicu() {
   render();
   const parts = [];
   if (skipped) parts.push(`${skipped} 条已在列表里`);
+  if (probedGone) parts.push(`${probedGone} 条探测过、确认已经没了，跳过`);
   if (alreadyGone) parts.push(`${alreadyGone} 条已在「已删除记录」里，跳过`);
   const tail = parts.length ? `（${parts.join('，')}）` : '';
-  setAicuHint(`已加入 ${added} 条${tail}。勾选后点上面的「开始删除」即可。`, added ? '' : 'warn');
+  const warn = untested ? `　注意：其中 ${untested} 条还没探测过存活，` +
+    '想先筛掉已经删掉的，点「探测存活」。' : '';
+  setAicuHint(`已加入 ${added} 条${tail}。${warn}勾选后点上面的「删除评论」即可。`, added ? '' : 'warn');
   await loadAicu();
 }
 
@@ -398,8 +523,117 @@ function scheduleAicuRender() {
 
 function setAicuAuto(on) {
   autoRunning = !!on;
-  $('btn-aicu-auto').classList.toggle('hide', !!on);
-  $('btn-aicu-autostop').classList.toggle('hide', !on);
+  refreshAicuButtons();
+}
+
+function setAicuProbing(on) {
+  probing = !!on;
+  refreshAicuButtons();
+}
+
+/** 抓取/探测期间，这几个按钮统一收起或禁用，避免两件事互相干扰 */
+function refreshAicuButtons() {
+  const busy = autoRunning || probing || running;
+  $('btn-aicu-auto').classList.toggle('hide', autoRunning || probing);
+  $('btn-aicu-probe').classList.toggle('hide', autoRunning || probing);
+  $('btn-aicu-autostop').classList.toggle('hide', !(autoRunning || probing));
+  for (const id of ['btn-aicu-read', 'btn-aicu-merge', 'btn-aicu-clear']) {
+    const el = $(id);
+    if (el) el.disabled = busy;
+  }
+}
+
+/**
+ * 只读地探测每一条还在不在，把结果记下来。
+ *
+ * 这是这个功能最实用的一步：aicu 的清单里**绝大多数是早就删掉的评论**，
+ * 如果不管三七二十一全导进待删列表，就要花几十分钟一条条去问 B 站。
+ * 先探一遍，就只剩真正还活着的那些要处理了。
+ *
+ * 全程只发 GET（`/x/v2/reply/reply`），不碰删除接口 —— 探测本身不会改变任何东西。
+ */
+async function probeAicuAlive() {
+  if (probing || autoRunning || running) return;
+
+  const all = await listAicuItems();
+  const todo = all.filter(i => i.alive === undefined);
+  if (!all.length) { setAicuHint('清单是空的，先导入再说。', 'warn'); return; }
+  if (!todo.length) { setAicuHint('所有条目都已经探测过了，没有要再探的。', ''); return; }
+
+  setAicuProbing(true);
+  probeStop = false;
+
+  let tabId;
+  try {
+    tabId = await acquireWorkerTab();
+  } catch (e) {
+    setAicuProbing(false);
+    setAicuHint('打不开 bilibili 页面，探测已中止。', 'bad');
+    return;
+  }
+
+  // 探测同样要注入页面，所以也先自检一次
+  const check = await preflight(tabId);
+  if (!check.ok) {
+    setAicuProbing(false);
+    setAicuHint('探测没有开始。' + check.reason, 'bad');
+    return;
+  }
+
+  const estMin = Math.max(1, Math.round(todo.length * BC_PROBE_DELAY_MS / 60000));
+  setAicuHint(`正在只读探测存活：本次 ${todo.length} 条，预计约 ${estMin} 分钟。` +
+    '这不会删任何东西，只是问 B 站「这条还在不在」。中途可以点「停止」，测过的会记住。', '');
+
+  let alive = 0, gone = 0, unknown = 0, errStreak = 0;
+  const marks = {};
+
+  const flush = async function () {
+    if (!Object.keys(marks).length) return;
+    await markAicuAlive(marks);
+    for (const k of Object.keys(marks)) delete marks[k];
+  };
+
+  for (let i = 0; i < todo.length; i++) {
+    if (probeStop) break;
+
+    const it = todo[i];
+    const r = await checkAliveOne(tabId, it);
+
+    if (r.tabGone) {
+      workerTabId = null;
+      workerCreated = false;
+      try { tabId = await acquireWorkerTab(); } catch (e) { /* 下一轮再试 */ }
+      unknown++;
+    } else if (r.alive === true) {
+      alive++; marks[it.rpid] = true; errStreak = 0;
+    } else if (r.alive === false) {
+      gone++; marks[it.rpid] = false; errStreak = 0;
+    } else {
+      unknown++;
+      // 连续问不出结果，多半是触发风控了，歇一会儿
+      if (++errStreak >= 3) {
+        errStreak = 0;
+        setAicuHint('连续几次没问出结果，歇 15 秒再继续（多半是触发了风控）…', 'warn');
+        await sleep(15000);
+      }
+    }
+
+    if (i % 5 === 0 || i === todo.length - 1) {
+      await flush();
+      setAicuHint(`探测中 ${i + 1}/${todo.length} —— 还在 ${alive} 条，`
+        + `已经没了 ${gone} 条，没问出结果 ${unknown} 条。（只读，不会删东西）`, '');
+    }
+
+    if (i < todo.length - 1) await sleep(BC_PROBE_DELAY_MS);
+  }
+
+  await flush();
+  setAicuProbing(false);
+  await loadAicu();
+
+  const tail = probeStop ? '　（你让它停了，下次会接着探剩下的）' : '';
+  setAicuHint(`探测结束：还在 ${alive} 条，已经没了 ${gone} 条，没问出结果 ${unknown} 条。` +
+    `「加入待删列表」只会收下还活着的那些。${tail}`, 'warn');
 }
 
 /** 找一个已打开的 aicu.cc 标签页；没有就按已知 UID 开一个后台标签页 */
@@ -485,6 +719,12 @@ async function startAutoPage() {  if (autoRunning) return;
 }
 
 function stopAutoPage() {
+  // 探测是本地循环，置个标志就行
+  if (probing) {
+    probeStop = true;
+    setAicuHint('正在停止探测……当前这一条问完就停。已经探过的都记住了。', 'warn');
+    return;
+  }
   if (!autoRunning) return;
   setAicuHint('正在停止……当前这一页处理完就停。', 'warn');
 
@@ -701,11 +941,7 @@ function setUi(isRunning) {
   $('btn-reload').disabled = isRunning;
   $('btn-retry').disabled = isRunning;
   $('btn-purge').disabled = isRunning;
-  // 跑删除的时候别让用户同时去点 aicu 抓取/合并，两件事会互相干扰
-  for (const id of ['btn-aicu-auto', 'btn-aicu-merge', 'btn-aicu-clear']) {
-    const el = $(id);
-    if (el) el.disabled = isRunning;
-  }
+  refreshAicuButtons();
   if (isRunning) setPurgeConfirm(false);
 }
 
@@ -812,7 +1048,7 @@ async function acquireWorkerTab() {
 }
 
 /**
- * 注入主世界脚本删一条，然后等结果。
+ * 把一个函数注入 bilibili 页面的主世界跑，然后等它回话。删除和存活探测都走这里。
  *
  * 结果有两条回传通道，谁先到用谁：
  *   ① **控制台自己去页面取**（主）：注入的脚本把结果挂在 `window.__bcDelResults` 上，
@@ -822,10 +1058,13 @@ async function acquireWorkerTab() {
  * 为什么要把 ① 做成主通道：② 依赖「那个 bilibili 标签页里跑着当前版本的内容脚本」。
  * 如果标签页是装/更新扩展之前就开着的，内容脚本已经失效 —— 于是每条都静静地等满
  * 超时，一千多条就是八个多小时，而且看不出哪里坏了。① 没有这个依赖。
+ *
+ * 返回注入脚本写下的那个结果对象（原样，含 ok/code/message 以及各自的业务字段）。
  */
-async function deleteOne(tabId, target) {
+async function runInjected(tabId, fn, arg, timeoutMs) {
   const requestId = 'req-' + Date.now() + '-' + Math.random().toString(16).slice(2);
-  const OVERALL_MS = Number(BC_DELETE_TIMEOUT_MS) || 23000;
+  const OVERALL_MS = Number(timeoutMs || BC_DELETE_TIMEOUT_MS) || 23000;
+  const payload = Object.assign({}, arg, { requestId: requestId });
 
   // 通道 ①：轮询页面上的结果（超时不 resolve，交给总超时收尾）
   const viaPoll = (async function () {
@@ -844,12 +1083,10 @@ async function deleteOne(tabId, target) {
         });
       } catch (e) {
         // 页面被关了 / 被导航走了
-        return { ok: false, code: null, tabGone: true, message: '读取页面结果失败：' + ((e && e.message) || e) };
+        return { ok: false, tabGone: true, message: '读取页面结果失败：' + ((e && e.message) || e) };
       }
       const r = out && out[0] && out[0].result;
-      if (r && r.requestId === requestId) {
-        return { ok: !!r.ok, code: r.code, message: r.message || '' };
-      }
+      if (r && r.requestId === requestId) return r;
     }
     return new Promise(function () { /* 永不 resolve */ });
   })();
@@ -861,32 +1098,51 @@ async function deleteOne(tabId, target) {
   });
 
   const overallTimeout = sleep(OVERALL_MS + 1500).then(function () {
-    return { ok: false, code: null, message: '等待页面响应超时（' + Math.round(OVERALL_MS / 1000) + ' 秒）' };
+    return { ok: false, message: '等待页面响应超时（' + Math.round(OVERALL_MS / 1000) + ' 秒）' };
   });
 
-  // 先把删除指令注入进去
   try {
     const out = await chrome.scripting.executeScript({
       target: { tabId: tabId },
       world: 'MAIN',
-      func: mainWorldDelete,
-      args: [{ requestId: requestId, type: target.type, oid: target.oid, rpid: target.rpid }]
+      func: fn,
+      args: [payload]
     });
     // 同步返回（没走 async）时这里就能直接拿到结果
     const r = out && out[0] && out[0].result;
     if (r && r.requestId === requestId) {
       pending.delete(requestId);
-      return { ok: !!r.ok, code: r.code, message: r.message || '' };
+      return r;
     }
   } catch (e) {
     pending.delete(requestId);
     // 最常见的原因是通道标签页被关掉了，标记出来交给调用方换一个重试
-    return { ok: false, code: null, tabGone: true, message: '注入网页失败：' + ((e && e.message) || e) };
+    return { ok: false, tabGone: true, message: '注入网页失败：' + ((e && e.message) || e) };
   }
 
   const r = await Promise.race([viaPoll, viaMessage, overallTimeout]);
   pending.delete(requestId);
   return r;
+}
+
+/** 删一条。返回 { ok, code, message, tabGone? } */
+async function deleteOne(tabId, target) {
+  const r = await runInjected(tabId, mainWorldDelete,
+    { type: target.type, oid: target.oid, rpid: target.rpid });
+  if (r.tabGone) return { ok: false, code: null, tabGone: true, message: r.message };
+  return { ok: !!r.ok, code: r.code, message: r.message || '' };
+}
+
+/** 只读地探测一条还在不在。返回 { alive: true|false|null, message, tabGone? } */
+async function checkAliveOne(tabId, item) {
+  const r = await runInjected(tabId, mainWorldCheck,
+    { type: item.type, oid: item.oid, rpid: item.rpid }, 20000);
+  if (r.tabGone) return { alive: null, tabGone: true, message: r.message };
+  return {
+    alive: (r.alive === true || r.alive === false) ? r.alive : null,
+    code: r.code,
+    message: r.message || ''
+  };
 }
 
 /**

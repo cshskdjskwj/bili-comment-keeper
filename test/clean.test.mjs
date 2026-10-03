@@ -261,6 +261,124 @@ await test('aicu 条目的 type 是字符串时也能用', async () => {
   assert.equal(r.oid, '888');
 });
 
+console.log('\n— 存活探测（只读，不发删除请求） —');
+
+await test('探测：一级评论还在 → alive=true，且走的是只读 GET', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const calls = [];
+  sandbox.fetch = async (url) => {
+    calls.push(url);
+    return { json: async () => ({ code: 0, data: { root: { rpid: '999' } } }) };
+  };
+
+  const out = await sandbox.mainWorldCheck({ requestId: 'c1', type: 1, oid: '555', rpid: '999' });
+  assert.equal(out.alive, true);
+  assert.match(calls[0], /\/x\/v2\/reply\/reply/, '必须是读取接口');
+  assert.match(calls[0], /root=999/);
+  assert.ok(!/reply\/del/.test(calls[0]), '绝不能碰删除接口');
+});
+
+await test('探测：12006 没有该评论 → alive=false', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.fetch = async () => ({ json: async () => ({ code: 12006, message: '没有该评论' }) });
+
+  const out = await sandbox.mainWorldCheck({ requestId: 'c2', type: 1, oid: '555', rpid: '999' });
+  assert.equal(out.alive, false);
+});
+
+await test('探测：楼中楼被解析到根评论时，必须去会话里把本人找出来', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const calls = [];
+  sandbox.fetch = async (url) => {
+    calls.push(url);
+    // 第一次：拿二级评论 222 当 root 查 —— B 站解析到了根评论 111
+    if (url.includes('root=222')) {
+      return { json: async () => ({ code: 0, data: { root: { rpid: '111' } } }) };
+    }
+    // 第二次：拉 111 这条会话的回复，里面能找到 222
+    if (url.includes('root=111')) {
+      return {
+        json: async () => ({
+          code: 0,
+          data: { replies: [{ rpid: '222' }, { rpid: '333' }], page: { count: 2 } }
+        })
+      };
+    }
+    return { json: async () => ({ code: 0, data: {} }) };
+  };
+
+  const out = await sandbox.mainWorldCheck({ requestId: 'c3', type: 1, oid: '555', rpid: '222' });
+  assert.equal(out.alive, true, '会话里找到了本人 → 还在');
+  assert.ok(calls.length >= 2, '楼中楼必须多问一次会话列表，光看 code 会误判');
+});
+
+await test('探测：楼中楼已经不在会话里 → alive=false', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.fetch = async (url) => {
+    if (url.includes('root=222')) {
+      return { json: async () => ({ code: 0, data: { root: { rpid: '111' } } }) };
+    }
+    if (url.includes('root=111')) {
+      return { json: async () => ({ code: 0, data: { replies: [{ rpid: '333' }], page: { count: 1 } } }) };
+    }
+    return { json: async () => ({ code: 0, data: {} }) };
+  };
+
+  const out = await sandbox.mainWorldCheck({ requestId: 'c4', type: 1, oid: '555', rpid: '222' });
+  assert.equal(out.alive, false, '翻完会话都没有本人 → 已经没了');
+});
+
+await test('探测：风控/未登录一律算「不确定」，绝不误判成已删除', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.fetch = async () => ({ json: async () => ({ code: -509, message: '请求过于频繁' }) });
+
+  const out = await sandbox.mainWorldCheck({ requestId: 'c5', type: 1, oid: '555', rpid: '999' });
+  assert.equal(out.ok, false);
+  assert.equal(out.alive, null, '拿不准就得给 null —— 误判成"没了"会把还活着的评论漏掉');
+});
+
+await test('探测：接口返回不是 JSON 时也是「不确定」', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.fetch = async () => ({ json: async () => { throw new Error('bad json'); } });
+
+  const out = await sandbox.mainWorldCheck({ requestId: 'c6', type: 1, oid: '555', rpid: '999' });
+  assert.equal(out.alive, null);
+});
+
+await test('探测结果写进 window.__bcDelResults（和删除共用同一条回传通道）', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.fetch = async () => ({ json: async () => ({ code: 12006, message: '没有该评论' }) });
+
+  await sandbox.mainWorldCheck({ requestId: 'c7', type: 1, oid: '555', rpid: '999' });
+  const stored = sandbox.window.__bcDelResults.c7;
+  assert.ok(stored, '必须写进结果槽，控制台靠它取结果');
+  assert.equal(stored.alive, false);
+});
+
+await test('checkAliveOne：把注入结果收敛成 alive 三态', async () => {
+  const { sandbox } = await makeSandbox(async (arg, store) => {
+    setTimeout(() => {
+      store[arg.requestId] = { requestId: arg.requestId, ok: true, alive: false, code: 12006, message: '' };
+    }, 550);
+    return [{ result: undefined }];
+  });
+
+  const r = await sandbox.checkAliveOne(1, { type: 1, oid: '5', rpid: '9' });
+  assert.equal(r.alive, false);
+});
+
+await test('checkAliveOne：拿不准时返回 null 而不是 false', async () => {
+  const { sandbox } = await makeSandbox(async (arg, store) => {
+    setTimeout(() => {
+      store[arg.requestId] = { requestId: arg.requestId, ok: false, alive: null, code: -509, message: '请求过于频繁' };
+    }, 550);
+    return [{ result: undefined }];
+  });
+
+  const r = await sandbox.checkAliveOne(1, { type: 1, oid: '5', rpid: '9' });
+  assert.equal(r.alive, null);
+});
+
 /* ---------------------------------------------------------------- 汇总 */
 
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项\n`);

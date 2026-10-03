@@ -404,7 +404,7 @@ export function normalizeAicuItem(raw) {
 
   const root = String(raw.root === undefined || raw.root === null ? '0' : raw.root);
 
-  return {
+  const out = {
     rpid: rpid,
     type: type,
     oid: oid,
@@ -413,6 +413,10 @@ export function normalizeAicuItem(raw) {
     message: String(raw.message || '').slice(0, 200),
     ctime: Number(raw.ctime) || 0
   };
+
+  // 存活探测的结果：true=还在 / false=已经没了 / 不带=还没探过
+  if (raw.alive === true || raw.alive === false) out.alive = raw.alive;
+  return out;
 }
 
 const EMPTY_AICU = { uid: '', total: 0, updatedAt: 0, mixed: false, items: {} };
@@ -446,23 +450,62 @@ export async function mergeAicuItems(payload) {
   };
 
   let added = 0;
+  let enriched = 0;
   let capped = false;
   let count = Object.keys(next.items).length;   // 计数放在循环外，避免 O(n²)
+
   for (const raw of list) {
     const item = normalizeAicuItem(raw);
-    if (!item || next.items[item.rpid]) continue;
+    if (!item) continue;
+
+    const prev = next.items[item.rpid];
+    if (prev) {
+      // 已有的条目可能只有 rpid/type/oid（比如从 DOM 抠的，当时没读到正文和时间）。
+      // 这次拿到了更全的信息就补上 —— 否则那批条目会永远显示成「时间未知 · 评论」。
+      const patch = {};
+      if (!prev.message && item.message) patch.message = item.message;
+      if (!prev.ctime && item.ctime) patch.ctime = item.ctime;
+      if (!prev.type && item.type) patch.type = item.type;
+      if (!prev.oid && item.oid) patch.oid = item.oid;
+      if ((!prev.root || prev.root === '0') && item.root && item.root !== '0') patch.root = item.root;
+      if (Object.keys(patch).length) {
+        next.items[item.rpid] = Object.assign({}, prev, patch);
+        enriched++;
+      }
+      continue;
+    }
+
     if (count >= AICU_MAX_ITEMS) { capped = true; break; }
     next.items[item.rpid] = item;
     count++;
     added++;
   }
 
-  if (added) await chrome.storage.local.set({ [K_AICU]: next });
-  return { added: added, total: count, capped: capped, store: next };
+  if (added || enriched) await chrome.storage.local.set({ [K_AICU]: next });
+  return { added: added, enriched: enriched, total: count, capped: capped, store: next };
 }
 
 export async function clearAicuStore() {
   await chrome.storage.local.remove(K_AICU);
+}
+
+/**
+ * 记下存活探测的结果。
+ * marks 形如 { rpid: true|false }；true=还在，false=已经没了。
+ * 只标不改别的字段，也不删条目 —— 保留 `false` 是为了让你看得见"总共筛掉了多少"。
+ */
+export async function markAicuAlive(marks) {
+  const store = await getAicuStore();
+  let changed = 0;
+  for (const rpid of Object.keys(marks || {})) {
+    const it = store.items[rpid];
+    if (!it) continue;
+    if (it.alive === marks[rpid]) continue;
+    it.alive = marks[rpid];
+    changed++;
+  }
+  if (changed) await chrome.storage.local.set({ [K_AICU]: store });
+  return changed;
 }
 
 /** 删成功的评论从导入清单里移除，免得它一直挂在面板上 */

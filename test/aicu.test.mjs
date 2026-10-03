@@ -194,7 +194,8 @@ globalThis.chrome = {
 const shared = await import('../src/shared.js');
 const {
   normalizeAicuItem, aicuPageUrl, aicuTypeName,
-  mergeAicuItems, listAicuItems, removeAicuItems, clearAicuStore, getAicuStore
+  mergeAicuItems, listAicuItems, removeAicuItems, clearAicuStore, getAicuStore,
+  markAicuAlive
 } = shared;
 
 const item = (rpid, over) => Object.assign({
@@ -307,9 +308,10 @@ const AICU_AUTO = readFileSync(fileURLToPath(new URL('../src/aicu-auto.js', impo
  * aicu 渲染出来的每条评论里有两个链接：
  *   方式2 → .../h5/comment/sub?oid=&pageType=&root=   （oid 和 type 在这里）
  *   方式0 → .../video/av{oid}#reply{rpid}            （rpid 在这里）
- * 两者是同一个卡片里的兄弟节点。
+ * 两者是同一个卡片里的兄弟节点；卡片里还有正文（MuiTypography-body1）
+ * 和一行小字日期（MuiTypography-caption）。
  */
-function makeCard(rpid, type, oid, root) {
+function makeCard(rpid, type, oid, root, opts = {}) {
   const replyLink = {
     getAttribute: n => n === 'href' ? `https://www.bilibili.com/video/av${oid}#reply${rpid}` : null
   };
@@ -320,12 +322,31 @@ function makeCard(rpid, type, oid, root) {
       : null,
     parentElement: null
   };
+
+  const body = {
+    textContent: opts.message === undefined ? '这个衣服是 mod 吗[喜欢]' : opts.message,
+    children: []
+  };
+  const caption = {
+    textContent: opts.caption === undefined ? '2026/9/14 19:38:04 1' : opts.caption,
+    children: []
+  };
+
   const card = {
-    querySelector: sel => (sel.indexOf('#reply') >= 0 ? replyLink : null),
+    textContent: `${body.textContent} ${caption.textContent} 方式0 方式2 uid:350067609 爱来自aicu.cc`,
+    querySelector(sel) {
+      if (sel.indexOf('#reply') >= 0) return replyLink;
+      if (sel.indexOf('MuiTypography-body1') >= 0) return body;
+      if (sel.indexOf('MuiTypography-caption') >= 0) return caption;
+      return null;
+    },
+    querySelectorAll: () => [],
     parentElement: null
   };
-  subLink.parentElement = { querySelector: () => null, parentElement: card };
-  return { subLink, replyLink, card };
+
+  // 按钮行：文本很短（只有「方式0方式2」），所以"往上找卡片"那一步会跳过它
+  subLink.parentElement = { textContent: '方式0方式2', querySelector: () => null, parentElement: card };
+  return { subLink, replyLink, card, body, caption };
 }
 
 /**
@@ -520,6 +541,26 @@ await test('第二条路：直接从渲染出来的列表里抠出 rpid / type /
   assert.equal(dom[0].payload.uid, '1', 'uid 从地址里取');
 });
 
+await test('第二条路：正文和时间也能从卡片里读出来（不然列表全是「时间未知」）', async () => {
+  const p = makeAutoPage({
+    cards: [
+      makeCard('111', 1, '555', undefined, { message: '这个衣服是 mod 吗[喜欢]', caption: '2026/9/14 19:38:04 1' }),
+      makeCard('222', 1, '556', undefined, { message: '人才，转发了[笑哭]', caption: '2026/9/9 21:27:14 2' })
+    ]
+  });
+
+  p.fire({ __bcAicuCmd: { action: 'harvest-once' } });
+  await new Promise(r => setTimeout(r, 100));
+
+  const items = p.posts.find(m => m && m.__bcAicuDom).payload.items;
+  assert.equal(items[0].message, '这个衣服是 mod 吗[喜欢]');
+  assert.equal(items[1].message, '人才，转发了[笑哭]');
+
+  const expect = Math.floor(new Date(2026, 8, 14, 19, 38, 4).getTime() / 1000);
+  assert.equal(items[0].ctime, expect, '日期要解析成 unix 秒');
+  assert.ok(items[1].ctime > 0);
+});
+
 await test('第二条路：楼中楼能正确区分 root 与 rank', async () => {
   const p = makeAutoPage({
     cards: [makeCard('222', 1, '555', '111')]   // root=111 ≠ 自己 -> 楼中楼
@@ -594,6 +635,47 @@ await test('抓取期间重复发开始指令会被忽略，不会跑成两份',
   // 两份一起跑的话，点击数会明显翻倍；这里只该按一份的节奏增长
   const delta = afterSecond - afterFirst;
   assert.ok(delta <= 4, `重复开始指令不该让翻页速度翻倍（这 600ms 内点了 ${delta} 次）`);
+});
+
+await test('存活探测：normalizeAicuItem 会保留 alive 三态', async () => {
+  assert.equal(normalizeAicuItem({ rpid: '1', type: 1, oid: '5' }).alive, undefined, '没探过就不带这个字段');
+  assert.equal(normalizeAicuItem({ rpid: '1', type: 1, oid: '5', alive: true }).alive, true);
+  assert.equal(normalizeAicuItem({ rpid: '1', type: 1, oid: '5', alive: false }).alive, false);
+});
+
+await test('存活探测：markAicuAlive 标记结果并落盘', async () => {
+  localData.clear();
+  await mergeAicuItems({ uid: 'u', items: [item('1'), item('2'), item('3')] });
+
+  const changed = await markAicuAlive({ 1: true, 2: false, 999: true });
+  assert.equal(changed, 2, '不存在的 rpid 不算数');
+
+  const store = await getAicuStore();
+  assert.equal(store.items['1'].alive, true);
+  assert.equal(store.items['2'].alive, false);
+  assert.equal(store.items['3'].alive, undefined, '没标过的保持未探测');
+});
+
+await test('存活探测：重复标记同一结果不算改动', async () => {
+  localData.clear();
+  await mergeAicuItems({ uid: 'u', items: [item('1')] });
+  await markAicuAlive({ 1: true });
+  assert.equal(await markAicuAlive({ 1: true }), 0);
+});
+
+await test('存活探测：重新导入（补全正文）不会把已有的 alive 冲掉', async () => {
+  localData.clear();
+  // 先只有 rpid/type/oid，没有正文和时间
+  await mergeAicuItems({ uid: 'u', items: [item('1', { message: '', ctime: 0 })] });
+  await markAicuAlive({ 1: false });
+
+  // 再导一次，这回带上了正文和时间
+  await mergeAicuItems({ uid: 'u', items: [item('1', { message: '补上的正文', ctime: 1700000000 })] });
+
+  const store = await getAicuStore();
+  assert.equal(store.items['1'].message, '补上的正文', '正文应该被补上');
+  assert.equal(store.items['1'].ctime, 1700000000, '时间应该被补上');
+  assert.equal(store.items['1'].alive, false, 'alive 是探测的结论，不能被重新导入冲掉');
 });
 
 /* ---------------------------------------------------------------- 汇总 */

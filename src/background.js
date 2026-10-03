@@ -57,10 +57,10 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
  */
 async function handleAicuImport(payload) {
   const r = await mergeAicuItems(payload);
-  if (r.added) {
-    broadcast({ type: 'AICU_UPDATED', added: r.added, total: r.total });
+  if (r.added || r.enriched) {
+    broadcast({ type: 'AICU_UPDATED', added: r.added, enriched: r.enriched, total: r.total });
   }
-  return { ok: true, added: r.added, total: r.total, capped: r.capped };
+  return { ok: true, added: r.added, enriched: r.enriched, total: r.total, capped: r.capped };
 }
 
 /**
