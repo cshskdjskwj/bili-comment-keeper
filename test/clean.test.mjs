@@ -450,6 +450,8 @@ await test('探测拿不准时的原因会原样带出来（便于排查）', as
 
 console.log('\n— 注入的搬运函数 —');
 
+const REPLY_URL = 'https://api.bilibili.com/x/v2/reply/reply?type=1&oid=5&root=9&pn=1&ps=1';
+
 await test('mainWorldFetchReply：用原生 fetch、不带凭据、只把原文带回来', async () => {
   const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
   const calls = [];
@@ -459,12 +461,22 @@ await test('mainWorldFetchReply：用原生 fetch、不带凭据、只把原文�
   };
   sandbox.fetch = async () => { throw new Error('不该用被包过的 fetch'); };
 
-  const out = await sandbox.mainWorldFetchReply({ requestId: 'x', type: 1, oid: '5', root: '9', pn: 1, ps: 1 });
+  const out = await sandbox.mainWorldFetchReply({ requestId: 'x', url: REPLY_URL });
   assert.equal(out.ok, true);
   assert.equal(out.text, '{"code":12006}', '只搬运原文，判断交给控制台');
   assert.equal(calls[0].init.credentials, 'omit', '探测不带任何凭据');
-  assert.match(calls[0].url, /reply\/reply/);
+  assert.equal(calls[0].url, REPLY_URL, '地址原样透传，不在注入脚本里拼');
   assert.ok(sandbox.window.__bcDelResults.x, '结果要写进结果槽，供控制台取回');
+});
+
+await test('mainWorldFetchReply：没给地址就直接报错，不发请求', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  let called = 0;
+  sandbox.window.__bcNativeFetch = async () => { called++; return { status: 200, text: async () => '{}' }; };
+
+  const out = await sandbox.mainWorldFetchReply({ requestId: 'z' });
+  assert.equal(out.ok, false);
+  assert.equal(called, 0);
 });
 
 await test('mainWorldFetchReply：页面里没有原生 fetch 时退回页面的 fetch', async () => {
@@ -473,8 +485,87 @@ await test('mainWorldFetchReply：页面里没有原生 fetch 时退回页面的
   delete sandbox.window.__bcNativeFetch;
   sandbox.fetch = async () => { seen.push(1); return { status: 200, text: async () => '{"code":0}' }; };
 
-  await sandbox.mainWorldFetchReply({ requestId: 'y', type: 1, oid: '5', root: '9', pn: 1, ps: 1 });
+  await sandbox.mainWorldFetchReply({ requestId: 'y', url: REPLY_URL });
   assert.equal(seen.length, 1);
+});
+
+console.log('\n— 库视图渲染 —');
+
+await test('库列表：评论正文必须转义（内容来自互联网）', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+
+  const html = sandbox.libRowHtml({
+    rpid: '999', type: 1, oid: '555', root: '0', rank: 1,
+    message: '<img src=x onerror=alert(1)>正常文字',
+    ctime: 1700000000, state: 'live'
+  });
+
+  assert.ok(html.indexOf('<img') < 0, '标签本身绝不能被渲染出来');
+  assert.ok(html.indexOf('&lt;img') >= 0, '应该转义成实体');
+  assert.ok(html.indexOf('正常文字') >= 0, '正常文字要保留');
+});
+
+await test('库列表：有视频标题就显示标题，没有就退回 av 号', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const base = { rpid: '1', type: 1, oid: '555', root: '0', rank: 1, message: 'x', ctime: 1700000000, state: 'live' };
+
+  const withTitle = sandbox.libRowHtml(Object.assign({}, base, {
+    video: { title: '某个视频标题', owner: '某UP' }
+  }));
+  assert.ok(withTitle.indexOf('某个视频标题') >= 0, '有标题就该显示标题 —— 不然一列 av 号没法看');
+  assert.ok(withTitle.indexOf('某UP') >= 0);
+
+  const noTitle = sandbox.libRowHtml(base);
+  assert.ok(noTitle.indexOf('av555') >= 0, '没标题时退回 av 号');
+});
+
+await test('库列表：状态标签和两个链接都在', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const base = { rpid: '317447018496', type: 1, oid: '117267354356619', root: '0', rank: 1, message: 'x', ctime: 1700000000 };
+
+  assert.match(sandbox.libRowHtml(Object.assign({}, base, { state: 'live' })), /tag live[^>]*>还在/);
+  assert.match(sandbox.libRowHtml(Object.assign({}, base, { state: 'gone' })), /tag gone[^>]*>已没了/);
+  assert.match(sandbox.libRowHtml(Object.assign({}, base, { state: 'deleted' })), /tag deleted[^>]*>已删除/);
+  assert.match(sandbox.libRowHtml(Object.assign({}, base, { state: 'unknown' })), /未检查/);
+
+  const html = sandbox.libRowHtml(Object.assign({}, base, { state: 'live' }));
+  assert.match(html, /方式0/);
+  assert.match(html, /方式2/);
+  assert.match(html, /data-rpid="317447018496"/);
+});
+
+await test('库列表：没有正文时给个占位，不要空着', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const html = sandbox.libRowHtml({
+    rpid: '1', type: 1, oid: '5', root: '0', rank: 1, message: '', ctime: 0, state: 'unknown'
+  });
+  assert.ok(html.indexOf('（没有正文）') >= 0);
+  assert.ok(html.indexOf('时间未知') >= 0);
+});
+
+await test('分页：只有一页时不显示翻页器，多页时给页码', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+
+  sandbox.libPage = 0;
+  assert.equal(sandbox.libPagerHtml(10), '', '只有一页就不该有翻页器');
+
+  const p = sandbox.libPagerHtml(500);
+  assert.match(p, /data-page="prev"/);
+  assert.match(p, /data-page="next"/);
+  assert.match(p, /第 1 \/ 10 页/);
+});
+
+await test('状态筛选栏：计数和选中态', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.libStates = [];
+
+  const el = sandbox.document.getElementById('lib-states');
+  sandbox.renderLibFilters({ total: 100, live: 17, gone: 81, deleted: 2, unknown: 0 });
+
+  assert.match(el.innerHTML, /data-state="all"/);
+  assert.match(el.innerHTML, /还在 <b>17<\/b>/);
+  assert.match(el.innerHTML, /已没了 <b>81<\/b>/);
+  assert.equal((el.innerHTML.match(/chip on/g) || []).length, 1, '「全部」应该处于选中态');
 });
 
 /* ---------------------------------------------------------------- 汇总 */

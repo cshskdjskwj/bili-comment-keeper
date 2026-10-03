@@ -11,7 +11,8 @@ import {
   getSettings, getIndex, setIndex, ensureFolder, findFolder, buildTitle, parseCommentUrl,
   isBiliUrl, listBookmarks, listComments, mergeAicuItems,
   getAicuStore, K_SETTINGS,
-  normalizeAicuItem, aicuCommentUrl, aicuPageUrl
+  normalizeAicuItem, aicuCommentUrl, aicuPageUrl,
+  getLibrary, libraryStats, fmtTime
 } from './shared.js';
 
 /* ------------------------------------------------------------------ 记录 */
@@ -333,35 +334,59 @@ async function handleDeleted(payload) {
 /* ------------------------------------------------------------------ 角标 */
 
 /**
- * 角标 = **待处理总数** = 待删书签 + aicu 导入里还没处理的（按 rpid 去重，两边可能指着同一条）。
+ * 角标。显示什么由设置里的 badgeMode 决定：
  *
- * v1.0.x 的角标数的是「已删除、但还没清空记录」的条数 —— 发评论不涨、删评论才涨，
- * 反直觉到 README 得反复解释。现在改成「还有多少条等着你处理」。
+ *   off     不显示（**默认**）
+ *   live    显示库里"还在"的条数
+ *   pending 显示待处理总数（旧行为 = 待删书签 + 库里还没处理的，按 rpid 去重）
+ *
+ * 为什么默认改成不显示：产品定位从"把评论删干净"变成"本地评论管理器 + 备份"之后，
+ * 角标就不再是任务提醒了 —— 一个档案柜不需要在图标上顶一个数字催你。
+ * 想留着的在设置里打开即可。
  */
 async function updateBadge() {
   try {
     const settings = await getSettings();
+    const mode = String(settings.badgeMode || 'off');
 
-    const rpids = new Set();
-    const activeId = await findFolder(settings.folderActive);
-    if (activeId) {
-      for (const b of await listComments(activeId)) rpids.add(b.parsed.rpid);
+    if (mode === 'off') {
+      await chrome.action.setBadgeText({ text: '' });
+      const s = await libraryStats();
+      await chrome.action.setTitle({
+        title: `B站评论管家 · 库里 ${s.total} 条` +
+          (s.live ? `，还在 ${s.live} 条` : '') +
+          (s.probedAt ? `（上次巡检 ${fmtTime(s.probedAt)}）` : '')
+      });
+      return;
     }
 
-    const aicu = await getAicuStore();
-    const aicuN = Object.keys(aicu.items).length;
-    for (const rpid of Object.keys(aicu.items)) rpids.add(rpid);
+    let count = 0;
+    let tip = '';
 
-    const count = rpids.size;
+    if (mode === 'live') {
+      const s = await libraryStats();
+      count = s.live;
+      tip = `还在 ${s.live} 条（库里共 ${s.total} 条）`;
+    } else {
+      const rpids = new Set();
+      const activeId = await findFolder(settings.folderActive);
+      if (activeId) {
+        for (const b of await listComments(activeId)) rpids.add(b.parsed.rpid);
+      }
+      const lib = await getLibrary();
+      for (const rpid of Object.keys(lib.items)) {
+        if (lib.items[rpid].state !== 'deleted') rpids.add(rpid);
+      }
+      count = rpids.size;
+      tip = `待处理 ${count} 条`;
+    }
 
     await chrome.action.setBadgeBackgroundColor({ color: '#fb7299' });
     await chrome.action.setBadgeText({
       text: count > 0 ? (count > 999 ? '999+' : String(count)) : ''
     });
     await chrome.action.setTitle({
-      title: count > 0
-        ? `B站评论管家 · 待处理 ${count} 条` + (aicuN ? `（其中 aicu 导入 ${aicuN} 条）` : '')
-        : 'B站评论管家 · 没有待处理的评论'
+      title: `B站评论管家 · ${tip}`
     });
   } catch (e) {
     // 角标失败不影响主流程

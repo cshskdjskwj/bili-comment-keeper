@@ -49,6 +49,17 @@
     </div>
 
     <div class="field">
+      <label>工具栏角标</label>
+      <select id="badgeMode">
+        <option value="off">不显示（推荐）</option>
+        <option value="live">显示库里还活着的条数</option>
+        <option value="pending">显示待删除的条数</option>
+      </select>
+      <span class="desc">这个扩展的本职是<b>本地评论管理 + 备份</b>，不是催你干活的任务清单，
+        所以默认不在图标上顶数字。想要提醒就选后两项</span>
+    </div>
+
+    <div class="field">
       <label>删除间隔（毫秒）</label>
       <input type="number" id="minDelay" min="300" step="100" style="width:100px">
       <span class="desc">~</span>

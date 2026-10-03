@@ -13,7 +13,9 @@ export const DEFAULT_SETTINGS = {
   minDelay: 1500,                   // 删除间隔下限（毫秒）
   maxDelay: 4000,                   // 删除间隔上限（毫秒）
   recordContent: true,              // 是否把评论正文摘录进书签标题
-  clipboardFallback: false          // 手动「复制评论链接」时也记录（可能误记别人的评论，默认关）
+  clipboardFallback: false,         // 手动「复制评论链接」时也记录（可能误记别人的评论，默认关）
+  // 角标显示什么：off=不显示（默认，定位是管理器不是任务列表）/ live=库里的存活条数 / pending=待处理总数
+  badgeMode: 'off'
 };
 
 export const K_SETTINGS = 'bc_settings';
@@ -886,6 +888,20 @@ export async function removeLibItems(rpids) {
   }
   if (removed) await saveLibrary(lib);
   return removed;
+}
+
+/** 按 rpid 精确取几条（勾选的条目往往不在当前页，不能靠翻页去找） */
+export async function getLibItems(rpids) {
+  const list = (Array.isArray(rpids) ? rpids : []).map(String);
+  if (!list.length) return [];
+
+  const lib = await getLibrary();
+  const out = [];
+  for (const rpid of list) {
+    const it = lib.items[rpid];
+    if (it) out.push(it);
+  }
+  return out;
 }
 
 /** 视频标题缓存 */

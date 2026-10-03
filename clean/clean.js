@@ -11,6 +11,7 @@ import {
   sleep, randInt, escapeHtml, explainCode, sourceLabel, fmtTime, folderPath,
   getAicuStore, listAicuItems, clearAicuStore, removeAicuItems, markAicuAlive,
   aicuPageUrl, aicuTypeName, aicuCommentUrl, aicuSubUrl,
+  libraryStats, queryLib, getLibItems, missingVideoTitles, saveVideoTitles, videoKey,
   exportLibraryJSON, exportLibraryHTML, exportLibraryMarkdown, importLibraryJSON
 } from '../src/shared.js';
 
@@ -99,12 +100,8 @@ async function mainWorldFetchReply(arg) {
     return out;
   };
 
-  const url = 'https://api.bilibili.com/x/v2/reply/reply?type=' +
-    encodeURIComponent(String(arg.type)) +
-    '&oid=' + encodeURIComponent(String(arg.oid)) +
-    '&root=' + encodeURIComponent(String(arg.root)) +
-    '&pn=' + encodeURIComponent(String(arg.pn || 1)) +
-    '&ps=' + encodeURIComponent(String(arg.ps || 1));
+  const url = String(arg.url || '');
+  if (!url) return done({ ok: false, message: '没有给地址' });
 
   const doFetch = (typeof window.__bcNativeFetch === 'function')
     ? window.__bcNativeFetch
@@ -224,6 +221,7 @@ async function init() {
 }
 
 function bindEvents() {
+  bindLibraryEvents();
   $('btn-start').addEventListener('click', start);
 
   $('btn-settings').addEventListener('click', function () {
@@ -267,7 +265,7 @@ function bindEvents() {
     render();
   });
 
-  $('list').addEventListener('change', function (e) {
+  $('queue-list').addEventListener('change', function (e) {
     if (!e.target.classList.contains('ck')) return;
     const row = e.target.closest('.row');
     const it = row && items.find(i => String(i.id) === row.dataset.id);
@@ -456,30 +454,14 @@ async function loadAicu() {
   }
   setAicuHint(notes.join(' '), store.mixed ? 'warn' : '');
 
-  const shown = list.slice(0, AICU_RENDER_LIMIT);
-  $('aicu-list').innerHTML = shown.length
-    ? shown.map(function (it) {
-        const text = String(it.message || '').replace(/\s+/g, ' ').trim();
-        const when = it.ctime ? fmtTime(it.ctime * 1000) : '时间未知';
+  // 这个折叠区现在只管"抓取"，列表本身已经在上面那个库视图里了 ——
+  // 两边都画一遍只会让人分不清哪个才是真的，所以这里只留一句指向。
+  $('aicu-list').innerHTML = list.length
+    ? `<div class="empty" style="padding:10px 13px">这 ${list.length} 条都在上面的评论库里，` +
+      '用搜索和筛选看它们。这里只负责把它们抓下来。</div>'
+    : '<div class="empty" style="padding:10px 13px">还没有从 aicu.cc 抓到任何评论。</div>';
 
-        // aicu 页面上每条评论右下角那两个链接，原样搬过来：
-        //   方式0 = B 站的评论地址（带 #reply，点开能定位到这条）
-        //   方式2 = B 站的楼中楼详情页（判断"没有该评论/已关闭评论区/暂无评论"就看它）
-        const c0 = aicuCommentUrl(it);
-        const c2 = aicuSubUrl(it);
-
-        const dead = it.alive === false ? ' <i class="tag gone">已确认没了</i>' : '';
-        const live = it.alive === true ? ' <i class="tag live">还在</i>' : '';
-
-        return `<div class="arc-item" title="${escapeHtml(text || it.rpid)}">• [${when}] ` +
-          `${escapeHtml(aicuTypeName(it.type))} · ${escapeHtml(text.slice(0, 40) || '评论')}${dead}${live}` +
-          (c0 ? ` <a href="${escapeHtml(c0)}" target="_blank" rel="noreferrer">方式0</a>` : '') +
-          (c2 ? ` <a href="${escapeHtml(c2)}" target="_blank" rel="noreferrer">方式2</a>` : '') +
-          `</div>`;
-      }).join('') + (list.length > AICU_RENDER_LIMIT
-        ? `<div class="empty" style="padding:8px 13px">…还有 ${list.length - AICU_RENDER_LIMIT} 条未显示</div>`
-        : '')
-    : '<div class="empty" style="padding:10px 13px">还没有从 aicu.cc 导入任何评论。</div>';
+  await refreshLibrary();
 }
 
 /** 收集「已删除记录」里已有的 rpid —— 这些已经确认删过，别再浪费一次接口调用 */
@@ -1024,16 +1006,294 @@ function emptyText() {
   return '还没有记录。在 B 站发一条评论试试，或者从下面的 aicu.cc 导入历史评论。';
 }
 
+/* ============================================================ 评论库视图
+ *
+ * 这是产品的主界面：本地保存的所有评论，可搜索、可筛选、可排序、可翻页。
+ * 删除只是这一层之上的一个可选操作（「删除选中」），不再是主界面。
+ */
+
+let libQ = '';                 // 搜索词
+let libStates = [];            // 状态筛选；空 = 全部
+let libSort = 'time-desc';
+let libPage = 0;
+let libTimer = null;
+
+const LIB_PAGE_SIZE = 50;
+const libSelected = new Set();   // 勾选的 rpid
+
+const LIB_STATE_TAG = {
+  live: '<i class="tag live">还在</i>',
+  gone: '<i class="tag gone">已没了</i>',
+  deleted: '<i class="tag deleted">已删除</i>',
+  unknown: '<i class="tag">未检查</i>'
+};
+
+const LIB_FILTERS = [
+  { id: 'all', label: '全部' },
+  { id: 'live', label: '还在' },
+  { id: 'gone', label: '已没了' },
+  { id: 'deleted', label: '已删除' },
+  { id: 'unknown', label: '未检查' }
+];
+
+/** 库列表里的一行 */
+function libRowHtml(it) {
+  const when = it.ctime ? fmtTime(it.ctime * 1000) : '时间未知';
+  const text = String(it.message || '').replace(/\s+/g, ' ').trim() || '（没有正文）';
+  const v = it.video;
+  const title = (v && v.title)
+    ? v.title
+    : (Number(it.type) === 1 ? 'av' + it.oid : aicuTypeName(it.type) + ' ' + it.oid);
+  const kind = Number(it.rank) === 2 ? '楼中楼' : '一级评论';
+  const c0 = aicuCommentUrl(it);
+  const c2 = aicuSubUrl(it);
+
+  return `<div class="lrow s-${escapeHtml(it.state)}" data-rpid="${escapeHtml(it.rpid)}">
+    <input type="checkbox" class="ck" ${libSelected.has(it.rpid) ? 'checked' : ''}>
+    <div class="lrow-main">
+      <div class="lrow-title">${LIB_STATE_TAG[it.state] || ''}${escapeHtml(text)}</div>
+      <div class="lrow-vid">${escapeHtml(title)}${v && v.owner ? '　·　UP ' + escapeHtml(v.owner) : ''}</div>
+      <div class="lrow-meta">${escapeHtml(when)}　·　${escapeHtml(aicuTypeName(it.type))}　·　${kind}
+        　·　rpid ${escapeHtml(it.rpid)}${it.aliveCheckedAt ? '　·　查于 ' + escapeHtml(fmtTime(it.aliveCheckedAt)) : ''}</div>
+    </div>
+    <div class="lrow-links">
+      ${c0 ? `<a href="${escapeHtml(c0)}" target="_blank" rel="noreferrer">方式0</a>` : ''}
+      ${c2 ? `<a href="${escapeHtml(c2)}" target="_blank" rel="noreferrer">方式2</a>` : ''}
+    </div>
+  </div>`;
+}
+
+function libPagerHtml(total) {
+  const pages = Math.max(1, Math.ceil(total / LIB_PAGE_SIZE));
+  if (pages <= 1) return '';
+  const cur = Math.min(libPage, pages - 1);
+  return `<button class="btn mini ghost" data-page="prev"${cur === 0 ? ' disabled' : ''}>← 上一页</button>
+    <span class="pager-info">第 ${cur + 1} / ${pages} 页</span>
+    <button class="btn mini ghost" data-page="next"${cur >= pages - 1 ? ' disabled' : ''}>下一页 →</button>`;
+}
+
+function renderLibFilters(s) {
+  const counts = { all: s.total, live: s.live, gone: s.gone, deleted: s.deleted, unknown: s.unknown };
+  $('lib-states').innerHTML = LIB_FILTERS.map(function (f) {
+    const on = (f.id === 'all' && !libStates.length) || (libStates.length === 1 && libStates[0] === f.id);
+    return `<button class="chip${on ? ' on' : ''}" data-state="${f.id}">${f.label} <b>${counts[f.id] || 0}</b></button>`;
+  }).join('');
+}
+
+function updateLibSelection() {
+  $('btn-delete-selected').textContent = libSelected.size
+    ? `删除选中（${libSelected.size}）`
+    : '删除选中';
+  $('btn-aicu-bookmark').textContent = libSelected.size
+    ? `存入收藏夹（${libSelected.size}）`
+    : '存入收藏夹';
+}
+
+/** 重新算统计 + 重画列表。所有库操作最后都落到这里。 */
+async function refreshLibrary() {
+  const s = await libraryStats();
+
+  $('lib-total').textContent = s.total;
+  $('lib-live').textContent = s.live;
+  $('lib-gone').textContent = s.gone;
+  $('lib-deleted').textContent = s.deleted;
+  $('lib-unknown').textContent = s.unknown;
+  $('aicu-count').textContent = s.total;
+
+  const bits = [];
+  if (s.uid) bits.push('UID ' + s.uid);
+  if (s.totalOnSite) bits.push('站上共 ' + s.totalOnSite + ' 条');
+  if (s.videos) bits.push(s.videos + ' 个视频' + (s.titled < s.videos ? `（已缓存 ${s.titled} 个标题）` : ''));
+  if (s.probedAt) bits.push('上次巡检 ' + fmtTime(s.probedAt));
+  $('lib-updated').textContent = bits.join('　·　');
+
+  renderLibFilters(s);
+
+  const r = await queryLib({
+    q: libQ,
+    states: libStates,
+    sort: libSort,
+    offset: libPage * LIB_PAGE_SIZE,
+    limit: LIB_PAGE_SIZE
+  });
+
+  const pages = Math.max(1, Math.ceil(r.total / LIB_PAGE_SIZE));
+  if (libPage >= pages) {          // 删着删着当前页没了，退回去重画
+    libPage = pages - 1;
+    return await refreshLibrary();
+  }
+
+  const filtering = !!(libQ || libStates.length);
+  $('lib-count').textContent = r.total
+    ? `第 ${libPage * LIB_PAGE_SIZE + 1}–${Math.min(r.total, (libPage + 1) * LIB_PAGE_SIZE)} 条，共 ${r.total} 条`
+    : (filtering ? '没有匹配的评论' : '库里还没有评论');
+
+  $('list').innerHTML = r.items.length
+    ? r.items.map(libRowHtml).join('')
+    : `<div class="empty" style="padding:18px">${escapeHtml(filtering
+        ? '没有匹配的评论，换个词或者把筛选放宽。'
+        : '库里还没有评论。展开下面的「从 aicu.cc 抓取更多评论」开始。')}</div>`;
+
+  $('lib-pager').innerHTML = libPagerHtml(r.total);
+
+  // 「全选本页」要和本页实际勾选情况对齐
+  const pageCk = $('check-page');
+  const rows = $('list').querySelectorAll('.lrow');
+  let onPage = 0;
+  for (const row of rows) if (libSelected.has(row.dataset.rpid)) onPage++;
+  pageCk.checked = rows.length > 0 && onPage === rows.length;
+  pageCk.indeterminate = onPage > 0 && onPage < rows.length;
+
+  updateLibSelection();
+}
+
+/* ------------------------------------------------------- 库操作：删除选中 */
+
+/**
+ * 把库里勾选的评论放进删除队列。
+ * 注意是"放进队列"而不是立刻删 —— 删除不可逆，先让人看一眼队列。
+ */
+async function deleteSelected() {
+  if (running) return;
+  if (!libSelected.size) { setHint('先在库里勾选要删除的评论。', 'warn'); return; }
+
+  const picked = await getLibItems(Array.from(libSelected));
+  if (!picked.length) { setHint('勾选的条目在库里找不到了，刷新一下再看看。', 'bad'); return; }
+
+  const have = new Set();
+  for (const x of items) if (x.parsed && x.parsed.rpid) have.add(x.parsed.rpid);
+
+  let added = 0;
+  for (const it of picked) {
+    if (have.has(it.rpid)) continue;
+    items.push(aicuRow(it));
+    have.add(it.rpid);
+    added++;
+  }
+
+  render();
+  $('fold-delete').open = true;
+  libSelected.clear();
+  await refreshLibrary();
+
+  setHint(`已把 ${added} 条放进删除队列（重复的自动跳过）。` +
+    '展开「删除执行」核对一下再点「开始删除」—— 删除不可逆。', added ? '' : 'warn');
+}
+
+/* ------------------------------------------------------- 库操作：视频标题 */
+
+/**
+ * 拉视频标题。
+ *
+ * 库里只有 type:oid，显示出来是一堆 av123456789，根本没法浏览 —— 标题是
+ * 管理界面的刚需。按视频缓存，所以每个视频只会请求一次。
+ */
+async function fetchVideoTitles() {
+  const missing = await missingVideoTitles(30);
+  if (!missing.length) { setHint('所有视频都已经有标题了。', ''); return; }
+
+  setHint(`正在拉取 ${missing.length} 个视频的标题…`, '');
+  const map = {};
+  let ok = 0, fail = 0;
+
+  for (let i = 0; i < missing.length; i++) {
+    const info = await fetchVideoInfo(missing[i]);
+    if (info && info.title) { map[videoKey(missing[i].type, missing[i].oid)] = info; ok++; }
+    else fail++;
+    setHint(`拉取标题 ${i + 1}/${missing.length} —— 成功 ${ok}，失败 ${fail}。`, '');
+    if (i < missing.length - 1) await sleep(300);
+  }
+
+  if (ok) await saveVideoTitles(map);
+  await refreshLibrary();
+
+  const rest = (await missingVideoTitles(1)).length;
+  setHint(`标题拉取完成：成功 ${ok} 个，失败 ${fail} 个。` +
+    (fail ? '　失败的多半是被反爬拦了，过会儿再点一次。' : '') +
+    (rest ? '　还有视频没拉，可以再点一次。' : ''), fail ? 'warn' : '');
+}
+
+/* ------------------------------------------------------------ 事件接线 */
+
+function bindLibraryEvents() {
+  $('lib-q').addEventListener('input', function (e) {
+    const v = e.target.value;
+    clearTimeout(libTimer);
+    libTimer = setTimeout(function () { libQ = v; libPage = 0; refreshLibrary(); }, 220);
+  });
+
+  $('lib-sort').addEventListener('change', function (e) {
+    libSort = e.target.value;
+    libPage = 0;
+    refreshLibrary();
+  });
+
+  $('lib-states').addEventListener('click', function (e) {
+    const btn = e.target.closest ? e.target.closest('button[data-state]') : null;
+    if (!btn) return;
+    const id = btn.dataset.state;
+    if (id === 'all') libStates = [];
+    else libStates = (libStates.length === 1 && libStates[0] === id) ? [] : [id];
+    libPage = 0;
+    refreshLibrary();
+  });
+
+  $('lib-pager').addEventListener('click', function (e) {
+    const btn = e.target.closest ? e.target.closest('button[data-page]') : null;
+    if (!btn || btn.disabled) return;
+    libPage += btn.dataset.page === 'next' ? 1 : -1;
+    if (libPage < 0) libPage = 0;
+    refreshLibrary();
+  });
+
+  $('list').addEventListener('change', function (e) {
+    const ck = e.target.closest ? e.target.closest('input.ck') : null;
+    if (!ck) return;
+    const row = ck.closest('.lrow');
+    if (!row) return;
+    if (ck.checked) libSelected.add(row.dataset.rpid);
+    else libSelected.delete(row.dataset.rpid);
+
+    const rows = $('list').querySelectorAll('.lrow');
+    let on = 0;
+    for (const r of rows) if (libSelected.has(r.dataset.rpid)) on++;
+    $('check-page').checked = rows.length > 0 && on === rows.length;
+    $('check-page').indeterminate = on > 0 && on < rows.length;
+    updateLibSelection();
+  });
+
+  $('check-page').addEventListener('change', function (e) {
+    const on = e.target.checked;
+    const rows = $('list').querySelectorAll('.lrow');
+    for (const row of rows) {
+      if (on) libSelected.add(row.dataset.rpid);
+      else libSelected.delete(row.dataset.rpid);
+      const ck = row.querySelector('input.ck');
+      if (ck) ck.checked = on;
+    }
+    updateLibSelection();
+  });
+
+  $('btn-delete-selected').addEventListener('click', function () {
+    deleteSelected().catch(function (e) { setHint('操作失败：' + ((e && e.message) || e), 'bad'); });
+  });
+
+  $('btn-titles').addEventListener('click', function () {
+    if (running || autoRunning || probing) return;
+    fetchVideoTitles().catch(function (e) { setHint('拉标题失败：' + ((e && e.message) || e), 'bad'); });
+  });
+}
+
 function render() {
   const list = visibleItems();
-  $('list').innerHTML = list.length
+  $('queue-list').innerHTML = list.length
     ? list.map(rowHtml).join('')
     : `<div class="empty" style="padding:18px">${escapeHtml(emptyText())}</div>`;
   syncCounts();
 }
 
 function renderRow(it) {
-  const el = $('list').querySelector(`.row[data-id="${it.id}"]`);
+  const el = $('queue-list').querySelector(`.row[data-id="${it.id}"]`);
   if (!el) { render(); return; }
 
   el.className = 'row ' + it.status;
@@ -1372,7 +1632,7 @@ function interpretReplyCheck(json) {
 var probeDirectWorks = null;
 
 /**
- * 拿一次 /x/v2/reply/reply 的原始返回。两条路：
+ * 拿一个 B 站接口的原始返回。两条路：
  *
  *   ① **扩展自己直发**：查询评论的接口是公开只读的，不需要登录、不需要 cookie，
  *      所以理论上扩展自己就能问，而且快得多、不用开标签页。
@@ -1382,29 +1642,29 @@ var probeDirectWorks = null;
  *
  * 先试 ①，被拦了就永久切到 ② —— 不会比只有 ② 更差，而 ① 通的话会快很多。
  */
-async function fetchReplyRaw(arg) {
+async function fetchBiliJson(url) {
   if (probeDirectWorks !== false) {
     try {
-      const res = await withTimeout(fetch(buildReplyUrl(arg), { credentials: 'omit' }), 12000, null);
+      const res = await withTimeout(fetch(url, { credentials: 'omit' }), 12000, null);
       if (res) {
         const text = await res.text().catch(() => '');
         const json = safeJson(text);
         if (json && typeof json.code === 'number') {
           if (probeDirectWorks === null) {
             probeDirectWorks = true;
-            log('探测通道：扩展直接发就行（更快，也不用开标签页）');
+            log('取数通道：扩展直接发就行（更快，也不用开标签页）');
           }
           return { json: json };
         }
         probeDirectWorks = false;
-        log('探测通道：扩展直接发被拦了（HTTP ' + res.status + '），改用 bilibili 标签页。');
+        log('取数通道：扩展直接发被拦了（HTTP ' + res.status + '），改用 bilibili 标签页。');
       } else {
         probeDirectWorks = false;
-        log('探测通道：扩展直接发超时，改用 bilibili 标签页。');
+        log('取数通道：扩展直接发超时，改用 bilibili 标签页。');
       }
     } catch (e) {
       probeDirectWorks = false;
-      log('探测通道：扩展直接发失败（' + ((e && e.message) || e) + '），改用 bilibili 标签页。');
+      log('取数通道：扩展直接发失败（' + ((e && e.message) || e) + '），改用 bilibili 标签页。');
     }
   }
 
@@ -1415,9 +1675,7 @@ async function fetchReplyRaw(arg) {
   } catch (e) { tabId = null; }
   if (!tabId) return { error: '打不开 bilibili 标签页' };
 
-  const r = await runInjected(tabId, mainWorldFetchReply, {
-    type: arg.type, oid: arg.oid, root: arg.root, pn: arg.pn, ps: arg.ps
-  }, 12000, 'MAIN');
+  const r = await runInjected(tabId, mainWorldFetchReply, { url: url }, 12000, 'MAIN');
 
   if (r.tabGone) {
     workerTabId = null;
@@ -1431,6 +1689,34 @@ async function fetchReplyRaw(arg) {
     return { error: '页面取回的是网页而不是数据（HTTP ' + r.status + '），可能被反爬拦了' };
   }
   return { json: json };
+}
+
+/** 按 /x/v2/reply/reply 的参数取一次 */
+async function fetchReplyRaw(arg) {
+  return await fetchBiliJson(buildReplyUrl(arg));
+}
+
+/**
+ * 取视频信息（标题 / UP 主 / BV 号）。
+ *
+ * 库里只存了 type:oid，列表上显示出来就是一堆 av123456789 —— 标题是管理界面的刚需。
+ * 只处理视频（type 1）；其它类型（专栏、动态）接口各不相同，先不碰，列表里退回类型名。
+ */
+async function fetchVideoInfo(v) {
+  if (Number(v.type) !== 1) return null;
+
+  const r = await fetchBiliJson('https://api.bilibili.com/x/web-interface/view?aid=' +
+    encodeURIComponent(String(v.oid)));
+  if (r.error) return null;
+
+  const d = r.json && r.json.data;
+  if (!d || !d.title) return null;
+
+  return {
+    title: String(d.title).slice(0, 200),
+    bvid: String(d.bvid || ''),
+    owner: String((d.owner && d.owner.name) || '')
+  };
 }
 
 /**

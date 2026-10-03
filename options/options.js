@@ -29,6 +29,7 @@ async function render() {
   $('folderDeleted').value = s.folderDeleted;
   $('minDelay').value = s.minDelay;
   $('maxDelay').value = s.maxDelay;
+  $('badgeMode').value = ['off', 'live', 'pending'].indexOf(s.badgeMode) >= 0 ? s.badgeMode : 'off';
 
   $('ver').textContent = 'v' + chrome.runtime.getManifest().version;
 
@@ -85,7 +86,9 @@ $('btn-save').addEventListener('click', async function () {
       folderActive: folderActive,
       folderDeleted: folderDeleted,
       minDelay: minDelay,
-      maxDelay: maxDelay
+      maxDelay: maxDelay,
+      badgeMode: ['off', 'live', 'pending'].indexOf($('badgeMode').value) >= 0
+        ? $('badgeMode').value : 'off'
     });
 
     // 立刻把目录建好；如果旧的两个目录还在书签栏顶层，这里会把它们整个搬进新位置
