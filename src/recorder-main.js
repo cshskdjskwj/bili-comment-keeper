@@ -171,6 +171,17 @@
 
   /* ------------------------------------------------------------ 挂钩 fetch */
   var origFetch = window.fetch;
+
+  // 把「页面自己的脚本还没跑、我们也没包过」的原生 fetch 抢存一份。
+  //
+  // 为什么必须抢：B 站自己的 API 层会包装 window.fetch，我们下面也会再包一层。
+  // 从主世界发出去的请求因此会依次穿过这些包装，行为变得不可预期 ——
+  // 存活探测「一条都问不出来」就是这么来的。扩展自己发的请求改用这份原生版本，
+  // 路径就短到底了。（内容脚本在 document_start 跑，此时 B 站的脚本还没执行。）
+  try {
+    if (typeof origFetch === 'function') window.__bcNativeFetch = origFetch.bind(window);
+  } catch (e) { /* 忽略 */ }
+
   if (typeof origFetch === 'function') {
     window.fetch = function (input, init) {
       var url = '';

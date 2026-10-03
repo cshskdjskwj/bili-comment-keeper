@@ -41,10 +41,16 @@ async function mainWorldDelete(arg) {
   const m = /(?:^|;\s*)bili_jct=([^;]+)/.exec(document.cookie || '');
   if (!m) return done({ ok: false, code: null, message: '页面里读不到 bili_jct，请确认浏览器已登录 bilibili' });
 
+  // 用原生 fetch（recorder-main.js 在 document_start 抢存的那份）。
+  // 直接用 window.fetch 的话，请求会穿过 B 站自己的 API 包装层，行为不可预期。
+  const doFetch = (typeof window.__bcNativeFetch === 'function')
+    ? window.__bcNativeFetch
+    : window.fetch.bind(window);
+
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 15000);
   try {
-    const res = await fetch('https://api.bilibili.com/x/v2/reply/del', {
+    const res = await doFetch('https://api.bilibili.com/x/v2/reply/del', {
       method: 'POST',
       credentials: 'include',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -72,6 +78,14 @@ async function mainWorldDelete(arg) {
  *   没了   → code 12006「没有该评论」
  * 这两种返回都用真实数据实测过。
  *
+ * **不需要登录、不需要 cookie** —— 别人本来就能查你的评论。所以这里用
+ * `credentials: 'omit'`，不带任何凭据：探测因此在你没登录时也能用，
+ * 而且完全不存在 CSRF 之类的顾虑。
+ *
+ * 但**必须从 B 站页面里发**（同站、不带 Origin 头）。实测过：一旦请求带上
+ * `Origin: chrome-extension://…`（扩展页面直接 fetch 就是这个下场），
+ * B 站的反爬会回一个 HTML 页面而不是 JSON。所以探测仍然要借一个 bilibili 标签页。
+ *
  * **楼中楼要特别处理**：把二级评论的 rpid 当 root 去查时，B 站会把它解析到所属的
  * 根评论、照样返回 code 0 —— 所以光看 code 不够，还得去那条会话的回复列表里
  * 找它本人在不在。找到了才算活着。
@@ -96,15 +110,36 @@ async function mainWorldCheck(arg) {
   const q = 'type=' + encodeURIComponent(String(arg.type)) +
     '&oid=' + encodeURIComponent(String(arg.oid));
 
+  // 用原生 fetch（recorder-main.js 在 document_start 抢存的那份）。
+  // 这就是「一条都探测不到」的症结：主世界的 window.fetch 已经不是原生 fetch 了，
+  // 它被 recorder-main.js 和 B 站自己的 API 层先后包过，行为不可预期。
+  const doFetch = (typeof window.__bcNativeFetch === 'function')
+    ? window.__bcNativeFetch
+    : window.fetch.bind(window);
+
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 15000);
 
   try {
-    const res = await fetch('https://api.bilibili.com/x/v2/reply/reply?' + q +
+    // credentials: 'omit' —— 查询评论本来就不需要登录，别带任何凭据
+    const res = await doFetch('https://api.bilibili.com/x/v2/reply/reply?' + q +
       '&root=' + encodeURIComponent(String(arg.rpid)) + '&pn=1&ps=1',
-      { credentials: 'include', signal: ctrl.signal });
-    const json = await res.json().catch(() => null);
-    if (!json) return done({ ok: false, alive: null, code: null, message: '接口返回不是 JSON' });
+      { credentials: 'omit', signal: ctrl.signal });
+
+    const text = await res.text().catch(() => '');
+    let json = null;
+    try { json = JSON.parse(text); } catch (e) { json = null; }
+
+    if (!json) {
+      // 这一步最值得说清楚：拿回 HTML 通常意味着请求被反爬拦了
+      const looksHtml = /^\s*</.test(text);
+      return done({
+        ok: false, alive: null, code: null,
+        message: looksHtml
+          ? '接口回了网页而不是数据（多半被反爬拦了），HTTP ' + res.status
+          : '接口返回不是 JSON，HTTP ' + res.status
+      });
+    }
 
     if (json.code === 12006) {
       return done({ ok: true, alive: false, code: 12006, message: json.message || '没有该评论' });
@@ -127,9 +162,9 @@ async function mainWorldCheck(arg) {
     // 楼中楼：B 站把我们解析到了所属的根评论，得去会话里把它本人找出来
     const rootId = String(root.rpid);
     for (let pn = 1; pn <= 3; pn++) {
-      const r2 = await fetch('https://api.bilibili.com/x/v2/reply/reply?' + q +
+      const r2 = await doFetch('https://api.bilibili.com/x/v2/reply/reply?' + q +
         '&root=' + encodeURIComponent(rootId) + '&pn=' + pn + '&ps=49',
-        { credentials: 'include', signal: ctrl.signal });
+        { credentials: 'omit', signal: ctrl.signal });
       const j2 = await r2.json().catch(() => null);
       if (!j2 || j2.code !== 0) break;
 
@@ -588,11 +623,31 @@ async function probeAicuAlive() {
     return;
   }
 
-  // 探测同样要注入页面，所以也先自检一次
-  const check = await preflight(tabId);
+  // 探测不需要登录（别人本来就能查你的评论），所以登录检查跳过。
+  // 只需要确认「能往 bilibili 页面里注入脚本」这一件事。
+  const check = await preflight(tabId, { requireLogin: false });
   if (!check.ok) {
     setAicuProbing(false);
     setAicuHint('探测没有开始。' + check.reason, 'bad');
+    return;
+  }
+
+  // 先单独试一条，把结果当场说出来 —— 不要让人对着进度等半天才发现根本不通
+  const firstTry = await withTimeout(checkAliveOne(tabId, todo[0]), 14000,
+    { alive: null, message: '第一条就超时（14 秒）' });
+  if (firstTry && firstTry.tabGone) {
+    setAicuProbing(false);
+    setAicuHint('探测没有开始：bilibili 标签页读取失败。把那个页面刷新一下再试。', 'bad');
+    return;
+  }
+  log(`探测试运行：第 1 条 rpid ${todo[0].rpid} → ` +
+    (firstTry.alive === true ? '还在' : firstTry.alive === false ? '已经没了' : '没问出结果')
+    + (firstTry.message ? '（' + firstTry.message + '）' : ''));
+
+  if (firstTry.alive === null) {
+    setAicuProbing(false);
+    setAicuHint('探测没有开始：第一条就没问出结果。' + (firstTry.message || '') +
+      '　把那个 bilibili 标签页刷新一下（F5）再试。', 'bad');
     return;
   }
 
@@ -1079,7 +1134,7 @@ async function acquireWorkerTab() {
 }
 
 /**
- * 把一个函数注入 bilibili 页面的主世界跑，然后等它回话。删除和存活探测都走这里。
+ * 把一个函数注入 bilibili 页面跑，然后等它回话。删除和存活探测都走这里。
  *
  * 结果有两条回传通道，谁先到用谁：
  *   ① **控制台自己去页面取**（主）：注入的脚本把结果挂在 `window.__bcDelResults` 上，
@@ -1090,12 +1145,20 @@ async function acquireWorkerTab() {
  * 如果标签页是装/更新扩展之前就开着的，内容脚本已经失效 —— 于是每条都静静地等满
  * 超时，一千多条就是八个多小时，而且看不出哪里坏了。① 没有这个依赖。
  *
+ * **world 很重要，别随手改**：
+ *   - `'MAIN'`（默认）：主世界。删除必须在这里 —— `recorder-main.js` 要在这一层
+ *     挂钩删除请求，手动删除的评论才能被记进账本。
+ *   - `'ISOLATED'`：内容脚本所在的世界。**它的 fetch 是干净的**，没有被我们自己的
+ *     钩子包过，也没有被 B 站自己的 fetch 包装改写。存活探测是只读的、不需要谁记账，
+ *     所以放这里 —— 之前放主世界，探测请求会走进 B 站的包装层，一条都问不出来。
+ *
  * 返回注入脚本写下的那个结果对象（原样，含 ok/code/message 以及各自的业务字段）。
  */
-async function runInjected(tabId, fn, arg, timeoutMs) {
+async function runInjected(tabId, fn, arg, timeoutMs, world) {
   const requestId = 'req-' + Date.now() + '-' + Math.random().toString(16).slice(2);
   const OVERALL_MS = Number(timeoutMs || BC_DELETE_TIMEOUT_MS) || 23000;
   const payload = Object.assign({}, arg, { requestId: requestId });
+  const useWorld = world || 'MAIN';
 
   // 通道 ①：轮询页面上的结果（超时不 resolve，交给总超时收尾）
   const viaPoll = (async function () {
@@ -1108,7 +1171,7 @@ async function runInjected(tabId, fn, arg, timeoutMs) {
         out = await withTimeout(
           chrome.scripting.executeScript({
             target: { tabId: tabId },
-            world: 'MAIN',
+            world: useWorld,          // 必须和被探测/删除的脚本在同一个世界，否则读不到那个结果槽
             func: function (id) {
               return (window.__bcDelResults && window.__bcDelResults[id]) || null;
             },
@@ -1144,7 +1207,7 @@ async function runInjected(tabId, fn, arg, timeoutMs) {
     injectedOut = await withTimeout(
       chrome.scripting.executeScript({
         target: { tabId: tabId },
-        world: 'MAIN',
+        world: useWorld,
         func: fn,
         args: [payload]
       }),
@@ -1185,9 +1248,11 @@ async function deleteOne(tabId, target) {
 
 /** 只读地探测一条还在不在。返回 { alive: true|false|null, message, tabGone? } */
 async function checkAliveOne(tabId, item) {
-  // 只读查询本来就快，给 10 秒足够；短一点还有一个好处：点「停止」时等待更短
+  // 只读查询本来就快，给 10 秒足够；短一点还有一个好处：点「停止」时等待更短。
+  // 留在主世界（连同 recorder-main.js 抢存的原生 fetch 一起）——
+  // 这样 Cookie / CORS 的行为和页面自己发请求完全一致，是已经被证明可用的那条路。
   const r = await runInjected(tabId, mainWorldCheck,
-    { type: item.type, oid: item.oid, rpid: item.rpid }, 10000);
+    { type: item.type, oid: item.oid, rpid: item.rpid }, 10000, 'MAIN');
   if (r.tabGone) return { alive: null, tabGone: true, message: r.message };
   return {
     alive: (r.alive === true || r.alive === false) ? r.alive : null,
@@ -1232,7 +1297,8 @@ async function deleteWithRecovery(target) {
  * 然后每条各自等 25 秒超时 —— 一千多条就是八个多小时，而且完全看不出哪里坏了。
  * 先拿一条假消息跑一遍，几秒钟就能给出可操作的结论。
  */
-async function preflight(tabId) {
+async function preflight(tabId, opts) {
+  const requireLogin = !(opts && opts.requireLogin === false);
   // 第一关：能不能注入、页面里读不读得到登录态
   let probe;
   try {
@@ -1258,13 +1324,14 @@ async function preflight(tabId) {
 
   const info = probe && probe[0] && probe[0].result;
   if (!info) return { ok: false, reason: '脚本注入进去了但没拿到返回值，那个标签页可能还没加载完。' };
-  if (!info.hasJct) {
+  if (requireLogin && !info.hasJct) {
     return {
       ok: false,
       reason: '在那个 bilibili 页面里读不到 bili_jct。请确认浏览器已登录 B 站，并把那个页面刷新一下再试。'
     };
   }
-  log('自检 1/2：注入正常，登录态正常（' + String(info.href).slice(0, 70) + '）');
+  log('自检 1/2：注入正常' + (requireLogin ? '，登录态正常' : '（探测不需要登录，跳过登录检查）') +
+    '（' + String(info.href).slice(0, 70) + '）');
 
   // 第二关：消息回传链路
   const requestId = 'pre-' + Date.now() + '-' + Math.random().toString(16).slice(2);

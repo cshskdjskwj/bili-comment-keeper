@@ -71,6 +71,7 @@ async function makeSandbox(injectHook) {
   const shared = await import('../src/shared.js');
   const pageStore = {};          // 模拟页面上的 window.__bcDelResults
   const posts = [];              // 模拟页面发出的 postMessage
+  const worlds = [];             // 记录每次注入用的世界（MAIN / ISOLATED）
 
   const chromeStub = {
     runtime: {
@@ -90,8 +91,9 @@ async function makeSandbox(injectHook) {
       onUpdated: { addListener() {}, removeListener() {} }
     },
     scripting: {
-      async executeScript({ args }) {
+      async executeScript({ args, world }) {
         const a = args || [];
+        worlds.push(world || 'MAIN');
         // 轮询读取：args[0] 是字符串（requestId）
         if (typeof a[0] === 'string') {
           return [{ result: pageStore[a[0]] || null }];
@@ -107,8 +109,28 @@ async function makeSandbox(injectHook) {
     document: fakeDoc,
     console, setTimeout, clearTimeout, clearInterval,
     URL, URLSearchParams, AbortController, Promise,
-    JSON, Math, Date, Number, String, Array, Object, RegExp, isFinite, Error,
-    fetch: async () => ({ json: async () => ({ code: 0, message: '' }) })
+    JSON, Math, Date, Number, String, Array, Object, RegExp, isFinite, Error
+  });
+
+  // fetch 装成 getter/setter：任何测试塞进来的假响应都自动补上 text()。
+  // 生产代码要拿 text() 才能分辨「返回的到底是数据、还是被反爬拦成的 HTML」，
+  // 但让每个测试桩都手写一遍 text() 太啰嗦，这里统一补上。
+  let fetchImpl = async () => ({ status: 200, json: async () => ({ code: 0, message: '' }) });
+  Object.defineProperty(sandbox, 'fetch', {
+    configurable: true,
+    get() {
+      return async function (...args) {
+        const res = await fetchImpl(...args);
+        if (res && typeof res === 'object') {
+          if (typeof res.text !== 'function' && typeof res.json === 'function') {
+            res.text = async () => JSON.stringify(await res.json());
+          }
+          if (res.status === undefined) res.status = 200;
+        }
+        return res;
+      };
+    },
+    set(fn) { fetchImpl = fn; }
   });
   sandbox.window = sandbox;
   sandbox.window.postMessage = m => posts.push(m);
@@ -116,7 +138,7 @@ async function makeSandbox(injectHook) {
   vm.createContext(sandbox);
   vm.runInContext(SRC, sandbox, { filename: 'clean.js' });
 
-  return { sandbox, pageStore, posts };
+  return { sandbox, pageStore, posts, worlds };
 }
 
 console.log('\n删除链路（clean.js）回归测试\n');
@@ -339,7 +361,7 @@ await test('探测：风控/未登录一律算「不确定」，绝不误判成�
 
 await test('探测：接口返回不是 JSON 时也是「不确定」', async () => {
   const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
-  sandbox.fetch = async () => ({ json: async () => { throw new Error('bad json'); } });
+  sandbox.fetch = async () => ({ status: 200, text: async () => '<!DOCTYPE html><html>被拦了</html>' });
 
   const out = await sandbox.mainWorldCheck({ requestId: 'c6', type: 1, oid: '555', rpid: '999' });
   assert.equal(out.alive, null);
@@ -416,6 +438,91 @@ await test('withTimeout：到点就返回兜底值', async () => {
 
   const fast = await sandbox.withTimeout(Promise.resolve('正常'), 5000, '兜底');
   assert.equal(fast, '正常', '正常返回时不该动它');
+});
+
+await test('删除和探测都在**主世界**跑 —— Cookie / CORS 与页面自己发请求一致', async () => {
+  // 为什么不去隔离世界：那里的 fetch 虽然干净，但 CORS / Origin 行为与主世界并不完全一样，
+  // 而"页面自己的源 + 原生 fetch"这条路是已经被证明可用的，就留在它上面。
+  const { sandbox, worlds } = await makeSandbox(async (arg, store) => {
+    setTimeout(() => {
+      store[arg.requestId] = { requestId: arg.requestId, ok: true, alive: true, code: 0, message: '' };
+    }, 550);
+    return [{ result: undefined }];
+  });
+
+  await sandbox.checkAliveOne(1, { type: 1, oid: '5', rpid: '9' });
+  await sandbox.deleteOne(1, { type: 1, oid: '5', rpid: '9' });
+
+  assert.ok(worlds.length >= 4, `注入 + 轮询各两次，至少四次，实际 ${worlds.length}`);
+  assert.ok(worlds.every(w => w === 'MAIN'),
+    `删除和探测都该在主世界，实际用过：${[...new Set(worlds)].join(', ')}`);
+});
+
+await test('扩展自己发的请求必须用「原生 fetch」，不能穿过页面的包装层', async () => {
+  // 这就是「一条都探测不到」的症结：主世界的 window.fetch 早就不是原生 fetch 了，
+  // 它被 recorder-main.js 和 B 站自己的 API 层先后包过。
+  // recorder-main.js 在 document_start 把原生版本抢存到 window.__bcNativeFetch，
+  // 这里断言：只要它在，删除和探测都必须用它。
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+
+  const seen = [];
+  const wrapped = async () => { seen.push('wrapped'); return { json: async () => ({ code: 12006 }) }; };
+  const native = async () => { seen.push('native'); return { json: async () => ({ code: 12006 }) }; };
+
+  sandbox.fetch = wrapped;
+  sandbox.window.__bcNativeFetch = native;
+
+  await sandbox.mainWorldCheck({ requestId: 'n1', type: 1, oid: '555', rpid: '999' });
+  await sandbox.mainWorldDelete({ requestId: 'n2', type: 1, oid: '555', rpid: '999' });
+
+  assert.deepEqual(seen, ['native', 'native'],
+    `删除和探测都该走原生 fetch，实际：${seen.join(', ')}`);
+});
+
+await test('没有原生 fetch 可抢时，退回页面自己的 fetch（不能直接报错）', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const seen = [];
+  sandbox.fetch = async () => { seen.push('page'); return { json: async () => ({ code: 12006 }) }; };
+  delete sandbox.window.__bcNativeFetch;
+
+  await sandbox.mainWorldCheck({ requestId: 'n3', type: 1, oid: '555', rpid: '999' });
+  assert.deepEqual(seen, ['page']);
+});
+
+await test('探测不带任何凭据 —— 查询评论本来就不需要登录', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const inits = [];
+  sandbox.fetch = async (url, init) => {
+    inits.push(init || {});
+    return { status: 200, text: async () => JSON.stringify({ code: 12006 }) };
+  };
+
+  await sandbox.mainWorldCheck({ requestId: 'c1', type: 1, oid: '5', rpid: '9' });
+  assert.ok(inits.length >= 1);
+  assert.equal(inits[0].credentials, 'omit',
+    '探测不该带 cookie：别人本来就能查你的评论，带上只会平添风险');
+});
+
+await test('探测被反爬拦成 HTML 时，给出说得清的原因', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.fetch = async () => ({ status: 412, text: async () => '<!DOCTYPE html><html>风险</html>' });
+
+  const out = await sandbox.mainWorldCheck({ requestId: 'c2', type: 1, oid: '5', rpid: '9' });
+  assert.equal(out.alive, null, '拿不准就是 null，不能当成"已经没了"');
+  assert.match(out.message, /反爬|网页/, `实际：${out.message}`);
+});
+
+await test('自检：探测不需要登录，删除才需要', async () => {
+  const { sandbox } = await makeSandbox(async () => [
+    { result: { hasJct: false, href: 'https://www.bilibili.com/', ready: 'complete' } }
+  ]);
+  sandbox.BC_PREFLIGHT_MS = 300;
+
+  const forDelete = await sandbox.preflight(1);
+  assert.equal(forDelete.ok, false, '删除必须登录，默认仍然要拦');
+
+  const forProbe = await sandbox.preflight(1, { requireLogin: false });
+  assert.equal(forProbe.ok, true, '探测不需要登录，不该被拦下来');
 });
 
 /* ---------------------------------------------------------------- 汇总 */

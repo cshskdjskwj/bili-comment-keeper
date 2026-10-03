@@ -5,6 +5,55 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.2] - 2026-10-04
+
+修掉「存活探测一条都问不出来」，并让探测**不需要登录**。
+
+### 修复
+
+- **扩展自己发的请求改用「原生 fetch」**
+  （[`src/recorder-main.js`](src/recorder-main.js)、[`clean/clean.js`](clean/clean.js)）
+
+  主世界里的 `window.fetch` **早就不是原生 fetch 了** —— 它被 `recorder-main.js`
+  和 **B 站自己的 API 层**先后包过，请求因此要穿过两层完全不可预期的代码。
+  这就是「一条都探测不到」的症结。
+
+  现在 `recorder-main.js` 在 `document_start`（B 站脚本还没执行的时候）把原生版本
+  抢存到 `window.__bcNativeFetch`，扩展自己发的删除和探测请求都改用它。
+
+- **探测不再需要登录，也不再带任何凭据**
+
+  实测确认：查询评论的接口**公开可读**，任何人不需要登录就能查。所以：
+
+  - 探测的开工自检不再要求 `bili_jct` —— **没登录也能筛**；
+  - 探测请求一律 `credentials: 'omit'`，完全不带 cookie。
+
+- **探测前先单独试一条，当场报结果**
+
+  以前是闷头开跑，通不通要等半天才看得出来。现在先探第一条、把结论写进日志，
+  不通就立刻停下来把原因说清楚，而不是让人对着不动的进度条干等。
+
+- **被反爬拦成 HTML 时给出说得清的原因**，而不是笼统的「接口返回不是 JSON」。
+
+### 为什么探测仍然要借一个 bilibili 标签页
+
+因为**不能从扩展页面直接发**。实测（见下表）：请求一旦带上
+`Origin: chrome-extension://…`（扩展页面 `fetch` 就是这个下场），B 站的反爬会回一个
+HTML 页面而不是数据。从 B 站页面里发（同站、不带 `Origin`）才拿得到 JSON。
+
+| 请求头 | 真实存在的评论 | 不存在的 rpid |
+| --- | --- | --- |
+| 什么都不带 | `code 0`，`data.root` 正确 | `12006` |
+| 只带 UA | `code 0` | `12006` |
+| UA + Referer | `code 0` | `12006` |
+| **`Origin: chrome-extension://…`** | **HTML（被拦）** | **HTML** |
+
+### 新增测试
+
+[`test/clean.test.mjs`](test/clean.test.mjs) 增到 **30 项**，新增 3 项：
+探测请求必须 `credentials: 'omit'`、被拦成 HTML 时给得出原因、
+以及**自检对探测不要求登录、对删除仍然要求**。
+
 ## [1.3.1] - 2026-10-04
 
 修一个会**静默卡死**的问题：点了「探测存活」之后界面一动不动、风扇狂转、连「停止」都没反应。
