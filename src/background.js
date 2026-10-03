@@ -9,7 +9,7 @@
 
 import {
   getSettings, getIndex, setIndex, ensureFolder, findFolder, buildTitle,
-  parseCommentUrl, isBiliUrl, listBookmarks, listComments, K_SETTINGS
+  parseCommentUrl, isBiliUrl, listBookmarks, listComments, mergeAicuItems, K_SETTINGS
 } from './shared.js';
 
 /* ------------------------------------------------------------------ 记录 */
@@ -40,8 +40,27 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
       .catch(function (e) { sendResponse({ ok: false, reason: String((e && e.message) || e) }); });
     return true;
   }
+  // aicu.cc 页面上顺手读到的历史评论清单
+  if (msg && msg.type === 'AICU_REPLIES') {
+    handleAicuImport(msg.payload)
+      .then(function (r) { sendResponse(r); })
+      .catch(function (e) { sendResponse({ ok: false, reason: String((e && e.message) || e) }); });
+    return true;
+  }
   return false;
 });
+
+/**
+ * aicu 导入：只做去重落盘和通知，不碰索引。
+ * 真正的删除仍然走清除面板里那套（注入 B 站页面调 /x/v2/reply/del）。
+ */
+async function handleAicuImport(payload) {
+  const r = await mergeAicuItems(payload);
+  if (r.added) {
+    broadcast({ type: 'AICU_UPDATED', added: r.added, total: r.total });
+  }
+  return { ok: true, added: r.added, total: r.total, capped: r.capped };
+}
 
 /**
  * 索引锁：rpid -> 元数据的「读-改-写」必须串行。

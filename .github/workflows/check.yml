@@ -33,10 +33,11 @@ jobs:
             echo "OK  $f"
           done
 
-      - name: 跑回归测试（云同步分片 + 接线检查）
+      - name: 跑回归测试（云同步分片 + 接线检查 + aicu 导入）
         run: |
           node test/sync-index.test.mjs
           node test/wiring.test.mjs
+          node test/aicu.test.mjs
 
       - name: 确认清单里引用的文件都存在
         run: |

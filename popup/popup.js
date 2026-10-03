@@ -3,7 +3,8 @@
  */
 
 import {
-  getSettings, setSettings, findFolder, listComments, escapeHtml, folderPath
+  getSettings, setSettings, findFolder, listComments, escapeHtml, folderPath,
+  getAicuStore
 } from '../src/shared.js';
 
 const $ = id => document.getElementById(id);
@@ -23,6 +24,13 @@ async function render() {
   $('arc-count').textContent = String(archived.length);
   $('path-line').textContent =
     `待清理：${folderPath(s, s.folderActive)}　|　归档：${folderPath(s, s.folderDeleted)}`;
+
+  // aicu.cc 导入的历史评论（用来补上装扩展之前发过的那些）
+  const aicu = await getAicuStore();
+  const aicuN = Object.keys(aicu.items).length;
+  $('aicu-line').textContent = aicuN
+    ? `aicu.cc 导入：${aicuN} 条待处理（UID ${aicu.uid || '未知'}）`
+    : 'aicu.cc 导入：空 —— 打开 aicu.cc 的评论页可自动导入历史评论';
 
   const box = $('recent');
   if (!pending.length) {

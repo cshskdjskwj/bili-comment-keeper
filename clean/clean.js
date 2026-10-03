@@ -8,7 +8,8 @@
 
 import {
   getSettings, getIndex, ensureFolder, parseCommentUrl, listBookmarks,
-  sleep, randInt, escapeHtml, explainCode, sourceLabel, fmtTime, folderPath
+  sleep, randInt, escapeHtml, explainCode, sourceLabel, fmtTime, folderPath,
+  getAicuStore, listAicuItems, clearAicuStore, removeAicuItems, aicuPageUrl, aicuTypeName
 } from '../src/shared.js';
 
 const $ = id => document.getElementById(id);
@@ -67,6 +68,12 @@ chrome.runtime.onMessage.addListener(function (msg) {
     return;
   }
 
+  // 在 aicu.cc 页面又抓到一批历史评论，跟着刷新导入区
+  if (msg.type === 'AICU_UPDATED') {
+    loadAicu().catch(function () {});
+    return;
+  }
+
   // 你在 B 站网页上自己删了评论，后台同步归档后通知面板更新那一行
   if (msg.type === 'SYNC_ARCHIVED' && msg.rpid) {
     const it = items.find(i => i.parsed && i.parsed.rpid === String(msg.rpid));
@@ -94,6 +101,7 @@ async function init() {
   bindEvents();
   await reload();
   await loadArchive();
+  await loadAicu();
 }
 
 function bindEvents() {
@@ -133,6 +141,21 @@ function bindEvents() {
     if (it) { it.checked = e.target.checked; syncCounts(); }
   });
 
+  // aicu.cc 导入区
+  $('btn-aicu-merge').addEventListener('click', function () {
+    if (running) return;
+    mergeAicu().catch(e => setAicuHint('加入失败：' + ((e && e.message) || e), 'bad'));
+  });
+  $('btn-aicu-clear').addEventListener('click', function () {
+    if (running) return;
+    clearAicuStore()
+      .then(function () {
+        setAicuHint('已清空导入清单。这不影响书签，也不影响 B 站上的评论。', '');
+        return loadAicu();
+      })
+      .catch(e => setAicuHint('清空失败：' + ((e && e.message) || e), 'bad'));
+  });
+
   // 清空归档：先弹确认，8 秒没动作自动收起
   $('btn-purge').addEventListener('click', function () { if (!running) setPurgeConfirm(true); });
   $('btn-purge-yes').addEventListener('click', function () {
@@ -154,6 +177,133 @@ async function loadArchive() {
   $('arc-list').innerHTML = list.length
     ? list.map(b => `<div class="arc-item" title="${escapeHtml(b.title)}">• <a href="${escapeHtml(b.url)}" target="_blank">${escapeHtml(b.title)}</a></div>`).join('')
     : '<div class="empty" style="padding:10px 13px">归档还是空的。删除评论后，链接会原样搬到这里。</div>';
+}
+
+/* ------------------------------------------------- aicu.cc 导入的历史评论
+ * 本扩展只记录「装好之后」发出的评论；装之前发的、手机上发的都抓不到。
+ * aicu.cc 存着完整历史，由 src/aicu-main.js 在它页面上顺手读回来。
+ * 这里只负责展示与并入待删列表 —— 删除走的是上面那套完全相同的流程。
+ */
+
+const AICU_RENDER_LIMIT = 200;
+
+function setAicuHint(text, kind) {
+  const el = $('aicu-hint');
+  el.className = 'hint' + (kind ? ' ' + kind : '');
+  el.textContent = text;
+}
+
+/** 把一条 aicu 记录转成待删列表里的行 */
+function aicuRow(item) {
+  const pageUrl = aicuPageUrl(item.type, item.oid);
+  const text = String(item.message || '').replace(/\s+/g, ' ').trim();
+  const when = item.ctime ? fmtTime(item.ctime * 1000) : '时间未知';
+  const excerpt = text ? (text.length > 24 ? text.slice(0, 24) + '…' : text) : '评论';
+
+  return {
+    id: 'aicu:' + item.rpid,
+    source: 'aicu',
+    type: Number(item.type),
+    oid: String(item.oid),
+    title: `[${when}] ${aicuTypeName(item.type)} · ${excerpt}`,
+    url: pageUrl,
+    parsed: {
+      url: pageUrl,
+      rpid: item.rpid,
+      rootId: item.root || item.rpid,
+      secondaryId: '',
+      isSecondary: Number(item.rank) !== 1,
+      bvid: '',
+      pageUrl: pageUrl
+    },
+    checked: true,
+    status: 'idle',
+    note: ''
+  };
+}
+
+async function loadAicu() {
+  if (!settings) return;   // 初始化还没走完
+
+  const store = await getAicuStore();
+  const list = await listAicuItems();
+  const merged = items.filter(i => i.source === 'aicu').length;
+
+  $('aicu-count').textContent = String(list.length);
+  $('aicu-uid').textContent = store.uid
+    ? ('UID ' + store.uid + (store.total ? ' · 站上记着 ' + store.total + ' 条' : ''))
+    : '';
+
+  const notes = [];
+  if (!list.length) {
+    notes.push('还没有导入。打开 https://www.aicu.cc/reply?uid=你的UID 翻几页，本扩展会自动把列表读进来。');
+  } else {
+    notes.push(`共 ${list.length} 条，其中 ${merged} 条已加入待删列表。`);
+    notes.push('提醒：aicu.cc 只是索引，删除发生在 B 站；已删评论也可能仍留在它的存档里。');
+  }
+  if (store.mixed) {
+    notes.push('⚠️ 这份清单里混了不止一个 UID 的数据，请确认都是你自己的账号。');
+  }
+  if (store.uid) {
+    notes.push('⚠️ 请确认上面的 UID 是你自己的。');
+  }
+  setAicuHint(notes.join(' '), store.mixed ? 'warn' : '');
+
+  const shown = list.slice(0, AICU_RENDER_LIMIT);
+  $('aicu-list').innerHTML = shown.length
+    ? shown.map(function (it) {
+        const url = aicuPageUrl(it.type, it.oid);
+        const text = String(it.message || '').replace(/\s+/g, ' ').trim();
+        const when = it.ctime ? fmtTime(it.ctime * 1000) : '时间未知';
+        return `<div class="arc-item" title="${escapeHtml(text || it.rpid)}">• <a href="${escapeHtml(url)}" target="_blank">[${when}] ${escapeHtml(aicuTypeName(it.type))} · ${escapeHtml(text.slice(0, 40) || '评论')}</a></div>`;
+      }).join('') + (list.length > AICU_RENDER_LIMIT
+        ? `<div class="empty" style="padding:8px 13px">…还有 ${list.length - AICU_RENDER_LIMIT} 条未显示</div>`
+        : '')
+    : '<div class="empty" style="padding:10px 13px">还没有从 aicu.cc 导入任何评论。</div>';
+}
+
+/** 收集「已删除」归档里已有的 rpid —— 这些已经确认删过，别再浪费一次接口调用 */
+async function archivedRpids() {
+  const set = new Set();
+  if (!deletedFolderId) return set;
+  const list = await listBookmarks(deletedFolderId).catch(function () { return []; });
+  for (const b of list) {
+    const p = parseCommentUrl(b.url);
+    if (p) set.add(p.rpid);
+  }
+  return set;
+}
+
+/** 把整个导入清单并进待删列表（按 rpid 去重，已删过的不再放回） */
+async function mergeAicu() {
+  const list = await listAicuItems();
+  if (!list.length) {
+    setAicuHint('清单是空的。先去 aicu.cc 打开你自己的评论页翻几页，再回来。', 'warn');
+    return;
+  }
+  if (running) return;
+
+  const known = new Set();
+  for (const i of items) if (i.parsed && i.parsed.rpid) known.add(i.parsed.rpid);
+
+  const archived = await archivedRpids();
+  let added = 0, skipped = 0, alreadyGone = 0;
+
+  for (const item of list) {
+    if (known.has(item.rpid)) { skipped++; continue; }
+    if (archived.has(item.rpid)) { alreadyGone++; continue; }
+    items.push(aicuRow(item));
+    known.add(item.rpid);
+    added++;
+  }
+
+  render();
+  const parts = [];
+  if (skipped) parts.push(`${skipped} 条已在列表里`);
+  if (alreadyGone) parts.push(`${alreadyGone} 条已在「已删除」归档里，跳过`);
+  const tail = parts.length ? `（${parts.join('，')}）` : '';
+  setAicuHint(`已加入 ${added} 条${tail}。勾选后点上面的「开始删除」即可。`, added ? '' : 'warn');
+  await loadAicu();
 }
 
 function setPurgeConfirm(on) {
@@ -210,7 +360,9 @@ async function reload() {
     });
   }
 
-  items = next;
+  // 书签列表重建时，把 aicu 导入的条目原样保留（它们没有书签）
+  const aicu = items.filter(i => i.source === 'aicu');
+  items = next.concat(aicu);
   stats = { ok: 0, fail: 0 };   // 刷新过列表，「本次成功/失败」不该再显示上一轮的旧数字
   render();
   if (skipped > 0) setHint(`目录里有 ${skipped} 条不是评论链接的书签，已自动跳过（不会被删除）。`, 'warn');
@@ -311,6 +463,12 @@ async function resolveAid(bvid) {
 
 async function resolveTarget(it) {
   const p = it.parsed;
+
+  // aicu 导入的条目自带评论区 id 与类型，直接就用，不必查索引
+  if (it.source === 'aicu' && it.oid && it.type !== null && it.type !== undefined) {
+    return { type: Number(it.type), oid: String(it.oid), rpid: p.rpid };
+  }
+
   let meta = indexCache[p.rpid] || null;
 
   // 面板手里的索引是打开那一刻的快照。这里没命中，很可能是刚发的评论，
@@ -453,6 +611,9 @@ async function deleteWithRecovery(target) {
 
 /** 把书签移进「已删除」目录；返回空串表示成功，否则返回错误说明 */
 async function archive(it) {
+  // aicu 导入的条目没有书签，删掉就是删掉了
+  if (it.source === 'aicu') return '';
+
   const isArchived = async function () {
     const arr = await chrome.bookmarks.get(it.id).catch(function () { return null; });
     return !!(arr && arr.length && arr[0].parentId === deletedFolderId);
@@ -528,7 +689,16 @@ async function start() {
   }
 
   let aborted = false;
-  const deletedRpids = [];   // 删成功的 rpid，最后交回后台清索引
+  let gone = 0;                    // 其中 B 站上早就没有了的（aicu 导入里占大多数）
+  const deletedRpids = [];         // 删成功的 rpid，最后交回后台清索引
+  const deletedAicuRpids = [];     // 其中来自 aicu 导入的，要从导入清单里移除
+
+  // 每条都要真调一次接口（删除接口本身就是"这条还在不在"的判据），
+  // 所以先把预计耗时说清楚，别让人以为卡住了。
+  const avgDelay = (Number(settings.minDelay) + Number(settings.maxDelay)) / 2;
+  const estMin = Math.max(1, Math.round(targets.length * avgDelay / 60000));
+  log(`本次 ${targets.length} 条，每条之间等 ${settings.minDelay}~${settings.maxDelay} 毫秒，预计约 ${estMin} 分钟。`);
+  log('中途可以点「停止」：已经处理过的会记账，下次不会重复处理。');
 
   for (let i = 0; i < targets.length; i++) {
     const it = targets[i];
@@ -558,11 +728,19 @@ async function start() {
       if (r.ok || r.code === 12022) {
         const moveErr = await archive(it);
         it.status = 'done';
-        it.note = moveErr || (r.ok ? '已删除' : '本来就不存在（已归档）');
+        if (r.ok) {
+          it.note = moveErr || '已删除';
+        } else {
+          gone++;
+          it.note = it.source === 'aicu'
+            ? 'B 站上已经没有这条了'
+            : (moveErr || '本来就不存在（已归档）');
+        }
         stats.ok++;
         delete indexCache[t.rpid];
         deletedRpids.push(t.rpid);
-        log('✓ ' + label(it) + (r.ok ? ' 已删除' : ' 早就被删了，直接归档'));
+        if (it.source === 'aicu') deletedAicuRpids.push(t.rpid);
+        log('✓ ' + label(it) + (r.ok ? ' 已删除' : ' 早就被删了'));
       } else {
         it.status = 'failed';
         it.note = explainCode(r.code, r.message);
@@ -584,6 +762,7 @@ async function start() {
   }
 
   await forgetRpids(deletedRpids);
+  await removeAicuItems(deletedAicuRpids);
   await refreshBadge();
 
   if (workerCreated && workerTabId !== null) {
@@ -597,14 +776,16 @@ async function start() {
   setUi(false);
   syncCounts();
   await loadArchive();
+  await loadAicu();
 
   const left = items.filter(i => i.status !== 'done').length;
+  const goneText = gone ? `，其中 ${gone} 条 B 站上早就没有了` : '';
   if (stats.fail === 0 && !aborted) {
-    setHint(`全部搞定：本次删除 ${stats.ok} 条，已全部归档到「${folderPath(settings, settings.folderDeleted)}」。目录里还剩 ${left} 条。`, '');
+    setHint(`全部搞定：本次处理 ${stats.ok} 条${goneText}。书签类已归档，aicu 导入的已从清单移除。列表里还剩 ${left} 条。`, '');
   } else {
-    setHint(`本次成功 ${stats.ok} 条，失败 ${stats.fail} 条。失败的书签仍然留在「${folderPath(settings, settings.folderActive)}」里，日志里有原因，修好后可点「重试失败项」。`, 'warn');
+    setHint(`本次成功 ${stats.ok} 条${goneText}，失败 ${stats.fail} 条。失败的书签仍然留在「${folderPath(settings, settings.folderActive)}」里，日志里有原因，修好后可点「重试失败项」。`, 'warn');
   }
-  log(`—— 结束：成功 ${stats.ok}，失败 ${stats.fail}，目录剩余 ${left} ——`);
+  log(`—— 结束：成功 ${stats.ok}（其中早就没有的 ${gone} 条），失败 ${stats.fail}，列表剩余 ${left} ——`);
 }
 
 /** 删一条，并把「连标签页都拿不到」这种情况收敛成一条失败原因，不让它掀翻整个循环 */

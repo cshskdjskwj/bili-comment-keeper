@@ -1,8 +1,8 @@
 /**
  * content.js —— 运行在网页「隔离世界」(ISOLATED world)
  *
- * 只做一件事：把主世界 recorder-main.js / 删除器 通过 window.postMessage
- * 发出来的消息，转发给扩展后台（或清除面板）。
+ * 只做一件事：把主世界 recorder-main.js / aicu-main.js / 删除器 通过
+ * window.postMessage 发出来的消息，转发给扩展后台（或清除面板）。
  */
 
 function sendToExtension(msg) {
@@ -25,6 +25,11 @@ window.addEventListener('message', function (ev) {
       // 这种情况要把对应书签同步归档，而不是新增记录。
       var type = d.payload.kind === 'deleted' ? 'COMMENT_DELETED' : 'RECORD_COMMENT';
       sendToExtension({ type: type, payload: d.payload });
+      return;
+    }
+    if (d.__bcAicu && d.payload && typeof d.payload === 'object') {
+      // aicu.cc 页面上顺手读到的历史评论，交给后台去重落盘
+      sendToExtension({ type: 'AICU_REPLIES', payload: d.payload });
       return;
     }
     if (d.__bcDeleterResult && typeof d.__bcDeleterResult === 'object') {

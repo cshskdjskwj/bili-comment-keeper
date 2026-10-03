@@ -22,6 +22,7 @@ export const K_INDEX_SYNC = 'bc_index_sync';   // v1.0.0 的单键格式，只�
 export const K_SYNC_META = 'bc_sync_meta';     // { chunks, bytes, at }
 export const K_SYNC_CHUNK = 'bc_sync_c';       // 分片键前缀，后面接序号
 export const K_SYNC_STATE = 'bc_sync_state';   // 上次云备份成功与否，给设置页显示
+export const K_AICU = 'bc_aicu';               // 从 aicu.cc 导入的历史评论清单
 
 /* chrome.storage.sync 的硬限制：单键 8192 字节、总量 102400 字节。
  * v1.0.0 把整个索引塞进一个键，实测第 15 条就超限，而失败被 .catch(() => {}) 静默吞掉，
@@ -364,6 +365,128 @@ export async function listComments(folderId) {
   return out;
 }
 
+/* ------------------------------------------- aicu.cc 导入的历史评论清单
+ * 本扩展只能记录「装好之后」发出的评论；装之前发的、在手机 App 上发的都抓不到。
+ * aicu.cc 存着完整的历史评论（它只是索引，评论实体仍在 B 站），所以由
+ * src/aicu-main.js 在页面上把列表读回来，这里负责去重落盘，
+ * 最后交给清除面板走**同一套**删除流程。
+ */
+
+const AICU_MAX_ITEMS = 20000;   // 别把 storage.local 撑爆（上限 10MB，每条约 150 字节）
+
+/** aicu 的 dyn.type -> 人能看懂的来源名 */
+export function aicuTypeName(type) {
+  const map = { 1: '视频', 11: '相册', 12: '专栏', 14: '音频', 17: '动态' };
+  return map[Number(type)] || ('类型' + type);
+}
+
+/** 用 aicu 给的 dyn.type / dyn.oid 拼一个能点开核对的 B 站地址 */
+export function aicuPageUrl(type, oid) {
+  const id = String(oid || '');
+  if (!id) return '';
+  switch (Number(type)) {
+    case 1: return 'https://www.bilibili.com/video/av' + id;
+    case 12: return 'https://www.bilibili.com/read/cv' + id;
+    default: return 'https://t.bilibili.com/' + id;
+  }
+}
+
+/** 规整一条 aicu 记录；缺关键字段（rpid / type / oid）就返回 null */
+export function normalizeAicuItem(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+
+  const rpid = String(raw.rpid === undefined || raw.rpid === null ? '' : raw.rpid);
+  if (!/^\d+$/.test(rpid)) return null;
+
+  const type = Number(raw.type);
+  const oid = String(raw.oid === undefined || raw.oid === null ? '' : raw.oid);
+  if (!Number.isFinite(type) || !/^\d+$/.test(oid)) return null;
+
+  const root = String(raw.root === undefined || raw.root === null ? '0' : raw.root);
+
+  return {
+    rpid: rpid,
+    type: type,
+    oid: oid,
+    root: /^\d+$/.test(root) ? root : '0',
+    rank: Number(raw.rank) || 1,
+    message: String(raw.message || '').slice(0, 200),
+    ctime: Number(raw.ctime) || 0
+  };
+}
+
+const EMPTY_AICU = { uid: '', total: 0, updatedAt: 0, mixed: false, items: {} };
+
+export async function getAicuStore() {
+  const o = await chrome.storage.local.get(K_AICU);
+  const s = o[K_AICU];
+  if (!s || typeof s !== 'object') return Object.assign({}, EMPTY_AICU, { items: {} });
+  return {
+    uid: String(s.uid || ''),
+    total: Number(s.total) || 0,
+    updatedAt: Number(s.updatedAt) || 0,
+    mixed: !!s.mixed,
+    items: (s.items && typeof s.items === 'object') ? s.items : {}
+  };
+}
+
+/** 合并一批刚抓到的评论（按 rpid 去重）；返回本次新增与累计条数 */
+export async function mergeAicuItems(payload) {
+  const incomingUid = String((payload && payload.uid) || '');
+  const list = Array.isArray(payload && payload.items) ? payload.items : [];
+
+  const store = await getAicuStore();
+  const next = {
+    uid: incomingUid || store.uid,
+    total: Number(payload && payload.total) || store.total,
+    updatedAt: Date.now(),
+    // 换了 uid 也照收（按约定只警告不拦），但把这件事记下来让界面能提示
+    mixed: store.mixed || !!(store.uid && incomingUid && store.uid !== incomingUid),
+    items: Object.assign({}, store.items)
+  };
+
+  let added = 0;
+  let capped = false;
+  let count = Object.keys(next.items).length;   // 计数放在循环外，避免 O(n²)
+  for (const raw of list) {
+    const item = normalizeAicuItem(raw);
+    if (!item || next.items[item.rpid]) continue;
+    if (count >= AICU_MAX_ITEMS) { capped = true; break; }
+    next.items[item.rpid] = item;
+    count++;
+    added++;
+  }
+
+  if (added) await chrome.storage.local.set({ [K_AICU]: next });
+  return { added: added, total: count, capped: capped, store: next };
+}
+
+export async function clearAicuStore() {
+  await chrome.storage.local.remove(K_AICU);
+}
+
+/** 删成功的评论从导入清单里移除，免得它一直挂在面板上 */
+export async function removeAicuItems(rpids) {
+  const list = Array.isArray(rpids) ? rpids.map(String) : [];
+  if (!list.length) return 0;
+
+  const store = await getAicuStore();
+  let removed = 0;
+  for (const rpid of list) {
+    if (store.items[rpid]) { delete store.items[rpid]; removed++; }
+  }
+  if (removed) await chrome.storage.local.set({ [K_AICU]: store });
+  return removed;
+}
+
+/** 清单按时间倒序，新的在前 */
+export async function listAicuItems() {
+  const store = await getAicuStore();
+  return Object.keys(store.items)
+    .map(k => store.items[k])
+    .sort((a, b) => (b.ctime || 0) - (a.ctime || 0));
+}
+
 /* -------------------------------------------------------- 评论链接的解析 */
 
 /** 判断是不是 B 站域名 */
@@ -418,6 +541,8 @@ export function sourceLabel(pageUrl) {
     const u = new URL(pageUrl);
     let m = /\/video\/(BV[0-9A-Za-z]+)/.exec(u.pathname);
     if (m) return m[1];
+    m = /\/video\/av(\d+)/i.exec(u.pathname);
+    if (m) return 'av' + m[1];
     m = /\/read\/cv(\d+)/i.exec(u.pathname);
     if (m) return 'cv' + m[1];
     m = /\/opus\/(\d+)/.exec(u.pathname);
