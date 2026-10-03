@@ -901,6 +901,55 @@ await test('「已检查」是除"未检查"之外的全部', async () => {
   assert.match(bar, /未检查 <b>1<\/b>/);
 });
 
+console.log('\n— 三个页面 —');
+
+await test('三个视图互斥：同一时间只显示一个', async () => {
+  const { sandbox, els } = await makeSandbox(async () => [{ result: undefined }]);
+
+  const state = () => ({
+    main: els.get('view-main').classList.contains('hide'),
+    imp: els.get('view-import').classList.contains('hide'),
+    data: els.get('view-data').classList.contains('hide')
+  });
+
+  sandbox.showView('main');
+  assert.deepEqual(state(), { main: false, imp: true, data: true });
+
+  sandbox.showView('import');
+  assert.deepEqual(state(), { main: true, imp: false, data: true });
+
+  sandbox.showView('data');
+  assert.deepEqual(state(), { main: true, imp: true, data: false });
+
+  sandbox.showView('main');
+  assert.deepEqual(state(), { main: false, imp: true, data: true });
+});
+
+await test('视图名不认识时退回主页，不会三个都藏起来', async () => {
+  const { sandbox, els } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.showView('乱七八糟');
+  assert.equal(els.get('view-main').classList.contains('hide'), false, '不能把自己的界面藏没了');
+  assert.equal(els.get('view-import').classList.contains('hide'), true);
+  assert.equal(els.get('view-data').classList.contains('hide'), true);
+});
+
+await test('来源标记：自己记录 / 导入分得清', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  assert.match(sandbox.libSourceTag({ source: 'record' }), /tag rec[^>]*>记录/);
+  assert.match(sandbox.libSourceTag({ source: 'aicu' }), /tag aicu[^>]*>导入/);
+  assert.match(sandbox.libSourceTag({}), /导入/, '没标来源的都算导入');
+});
+
+await test('库列表里同时带状态标签和来源标签', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const html = sandbox.libRowHtml({
+    rpid: '1', type: 1, oid: '5', root: '0', rank: 1,
+    message: 'x', ctime: 1700000000, state: 'live', source: 'record'
+  });
+  assert.match(html, /tag live[^>]*>还在/);
+  assert.match(html, /tag rec[^>]*>记录/);
+});
+
 /* ---------------------------------------------------------------- 汇总 */
 
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项\n`);

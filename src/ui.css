@@ -285,6 +285,27 @@ body.console { max-width: 780px; margin: 0 auto; padding: 0 12px 40px; }
 
 .tag.deleted { background: rgba(242, 85, 90, .14); color: var(--bad); border-color: transparent; }
 .tag.unreachable { background: rgba(226, 163, 61, .16); color: var(--warn); border-color: transparent; }
+/* 来源标记：自己刚发的 vs 从 aicu 导入的 */
+.tag.rec { background: rgba(72, 199, 142, .16); color: var(--ok); border-color: transparent; }
+
+/* ------------------------------------------------- 数据与存储页 */
+
+.data-block {
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--bg2); padding: 12px 14px; margin-top: 12px;
+}
+.data-block h3 { margin: 0 0 6px; font-size: 13.5px; font-weight: 600; }
+.data-line {
+  font-size: 12.5px; color: var(--txt-dim); line-height: 1.7;
+  word-break: break-word; font-variant-numeric: tabular-nums;
+}
+.data-block .desc {
+  font-size: 12px; color: var(--sub); line-height: 1.75; margin-top: 6px;
+}
+.data-block code {
+  background: var(--bg3); border-radius: 4px; padding: 0 4px;
+  font-size: 11.5px; font-family: ui-monospace, Consolas, monospace;
+}
 
 /* 折叠区：aicu 导入 / 已删除记录 / 日志 */
 .fold {

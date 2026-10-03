@@ -626,6 +626,9 @@ export async function queryLib(opts) {
 
   if (states) list = list.filter(it => states.indexOf(it.state) >= 0);
   if (oid) list = list.filter(it => String(it.oid) === oid);
+  if (o.source === 'record' || o.source === 'aicu') {
+    list = list.filter(it => it.source === o.source);
+  }
   if (q) {
     list = list.filter(it =>
       String(it.message || '').toLowerCase().indexOf(q) >= 0 ||

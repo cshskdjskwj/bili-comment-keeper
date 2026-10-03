@@ -7,7 +7,8 @@
  */
 
 import {
-  getSettings, parseCommentUrl, sleep, randInt, escapeHtml, explainCode, sourceLabel, fmtTime,
+  getSettings, setSettings, DEFAULT_SETTINGS, parseCommentUrl,
+  sleep, randInt, escapeHtml, explainCode, sourceLabel, fmtTime,
   aicuTypeName, aicuCommentUrl, aicuSubUrl,
   getLibrary, listLibItems, clearLibrary, removeLibItems, setLibStates, markLibDeleted,
   libraryStats, queryLib, getLibItems, missingVideoTitles, saveVideoTitles, videoKey,
@@ -222,9 +223,33 @@ function bindEvents() {
     chrome.runtime.openOptionsPage();
   });
 
-  // 主视图 ⇄ 导入视图
+  // 主视图 ⇄ 导入视图 ⇄ 数据页
   $('btn-open-import').addEventListener('click', function () { showView('import'); });
   $('btn-back-main').addEventListener('click', function () { showView('main'); });
+  $('btn-open-data').addEventListener('click', function () { showView('data'); });
+  $('btn-back-home2').addEventListener('click', function () { showView('main'); });
+
+  // 数据页上的操作
+  $('btn-data-export').addEventListener('click', function () { doExport('json'); });
+  $('btn-data-purge').addEventListener('click', function () {
+    purgeArchive().then(renderDataPage).catch(function (e) {
+      setHint('清理失败：' + ((e && e.message) || e), 'bad');
+    });
+  });
+  $('btn-data-clear').addEventListener('click', function () { setDataClearConfirm(true); });
+  $('btn-data-clear-no').addEventListener('click', function () { setDataClearConfirm(false); });
+  $('btn-data-clear-yes').addEventListener('click', function () {
+    clearWholeLibrary().catch(function (e) { setHint('清空失败：' + ((e && e.message) || e), 'bad'); });
+  });
+  $('btn-data-reset').addEventListener('click', function () {
+    setSettings(Object.assign({}, DEFAULT_SETTINGS))
+      .then(async function () {
+        settings = await getSettings();
+        await renderDataPage();
+        setHint('设置已恢复默认。评论库没动。', '');
+      })
+      .catch(function (e) { setHint('恢复失败：' + ((e && e.message) || e), 'bad'); });
+  });
 
   // 来源筛选
   $('filters').addEventListener('click', function (e) {
@@ -979,6 +1004,7 @@ function emptyText() {
 
 let libQ = '';                 // 搜索词
 let libStates = [];            // 状态筛选；空 = 全部
+let libSource = 'all';         // 来源筛选：all | record | aicu
 let libSort = 'time-desc';
 let libPage = 0;
 let libTimer = null;
@@ -999,6 +1025,13 @@ const LIB_STATE_TAG = {
   unreachable: '<i class="tag unreachable">查不到</i>',
   unknown: '<i class="tag">未检查</i>'
 };
+
+/** 这条是哪来的：自己刚发的，还是从 aicu 导入的历史评论 */
+function libSourceTag(it) {
+  return it.source === 'record'
+    ? '<i class="tag rec">记录</i>'
+    : '<i class="tag aicu">导入</i>';
+}
 
 const LIB_FILTERS = [
   { id: 'all', label: '全部' },
@@ -1033,7 +1066,7 @@ function libRowHtml(it) {
   return `<div class="lrow s-${escapeHtml(it.state)}" data-rpid="${escapeHtml(it.rpid)}">
     <input type="checkbox" class="ck" ${libSelected.has(it.rpid) ? 'checked' : ''}>
     <div class="lrow-main">
-      <div class="lrow-title">${LIB_STATE_TAG[it.state] || ''}${escapeHtml(text)}</div>
+      <div class="lrow-title">${LIB_STATE_TAG[it.state] || ''}${libSourceTag(it)}${escapeHtml(text)}</div>
       <div class="lrow-vid">${escapeHtml(title)}${v && v.owner ? '　·　UP ' + escapeHtml(v.owner) : ''}</div>
       <div class="lrow-meta">${escapeHtml(when)}　·　${escapeHtml(aicuTypeName(it.type))}　·　${kind}
         　·　rpid ${escapeHtml(it.rpid)}${it.aliveCheckedAt ? '　·　查于 ' + escapeHtml(fmtTime(it.aliveCheckedAt)) : ''}</div>
@@ -1099,6 +1132,7 @@ async function refreshLibrary() {
     q: libQ,
     // 「已检查」翻译成其余四态；库里并没有 checked 这个状态
     states: (libStates.length === 1 && libStates[0] === 'checked') ? CHECKED_STATES : libStates,
+    source: libSource,
     sort: libSort,
     offset: libPage * LIB_PAGE_SIZE,
     limit: LIB_PAGE_SIZE
@@ -1245,6 +1279,12 @@ function bindLibraryEvents() {
     refreshLibrary();
   });
 
+  $('lib-src').addEventListener('change', function (e) {
+    libSource = e.target.value === 'record' || e.target.value === 'aicu' ? e.target.value : 'all';
+    libPage = 0;
+    refreshLibrary();
+  });
+
   $('lib-states').addEventListener('click', function (e) {
     const btn = e.target.closest ? e.target.closest('button[data-state]') : null;
     if (!btn) return;
@@ -1304,22 +1344,77 @@ function bindLibraryEvents() {
 /* --------------------------------------------------------- 主视图 / 副视图 */
 
 /**
- * 面板只有两个视图：
- *   main   —— 评论库（日常都在这）
- *   import —— 导入历史（**一次性的初始化步骤**，不是日常功能）
+ * 面板有三个视图：
+ *   main   —— 评论库（**主页**：所有历史评论，日常都在这）
+ *   import —— 导入历史（一次性的初始化步骤，不是日常功能）
+ *   data   —— 数据与存储（数据都在哪、怎么删）
  *
- * 为什么把导入单独拆出去：它是"装上扩展之前发的评论怎么补"这个一次性问题的答案，
- * 放在主页当折叠区会让人以为它和库视图同等重要，喧宾夺主。
+ * 为什么把导入和存储都拆出去：它们回答的是"一开始怎么把数据弄进来"和
+ * "数据到底放在哪"这两个一次性问题，摆在主页会喧宾夺主。
  */
 function showView(name) {
-  const isImport = name === 'import';
-  $('view-main').classList.toggle('hide', isImport);
-  $('view-import').classList.toggle('hide', !isImport);
-  if (isImport) {
-    // 进来就顺手刷新一下导入区的情报
-    loadAicu().catch(function () {});
-  } else {
-    refreshLibrary().catch(function () {});
+  const want = (name === 'import' || name === 'data') ? name : 'main';
+  $('view-main').classList.toggle('hide', want !== 'main');
+  $('view-import').classList.toggle('hide', want !== 'import');
+  $('view-data').classList.toggle('hide', want !== 'data');
+
+  if (want === 'import') loadAicu().catch(function () {});
+  else if (want === 'data') renderDataPage().catch(function () {});
+  else refreshLibrary().catch(function () {});
+}
+
+/* -------------------------------------------------- 数据与存储页 */
+
+let dataClearTimer = null;
+
+function setDataClearConfirm(on) {
+  if (dataClearTimer) { clearTimeout(dataClearTimer); dataClearTimer = null; }
+  $('data-clear-confirm').classList.toggle('hide', !on);
+  $('btn-data-clear').classList.toggle('hide', !!on);
+  if (on) dataClearTimer = setTimeout(function () { setDataClearConfirm(false); }, 8000);
+}
+
+/** 把「数据都在哪、各有多少」如实写出来 */
+async function renderDataPage() {
+  const st = await libraryStats();
+  const s = await getSettings();
+
+  let bytes = 0;
+  try { bytes = await chrome.storage.local.getBytesInUse(null); } catch (e) { bytes = 0; }
+
+  $('data-lib').textContent =
+    `共 ${st.total} 条　·　还在 ${st.live}　·　已没了 ${st.gone}　·　已删除 ${st.deleted}` +
+    `　·　查不到 ${st.unreachable}　·　未检查 ${st.unknown}` +
+    `　·　其中自己记录 ${st.recorded} 条、导入 ${st.imported} 条` +
+    `　·　涉及 ${st.videos} 个视频` +
+    (st.probedAt ? `　·　上次巡检 ${fmtTime(st.probedAt)}` : '') +
+    (bytes ? `　·　本地存储共占用约 ${(bytes / 1024).toFixed(1)} KB` : '');
+
+  const badge = { off: '不显示', live: '显示还在的条数', pending: '显示还没处理的条数' }[s.badgeMode] || '不显示';
+  $('data-settings').textContent =
+    `自动记录${s.enabled ? '已开启' : '已关闭'}　·　角标${badge}` +
+    `　·　删除间隔 ${s.minDelay}~${s.maxDelay} 毫秒` +
+    `　·　同时写收藏夹${s.useBookmarks ? '已开启' : '已关闭'}`;
+}
+
+/** 把整个评论库删掉（设置和导出的文件都不动） */
+async function clearWholeLibrary() {
+  setDataClearConfirm(false);
+  $('btn-data-clear').disabled = true;
+  try {
+    await clearLibrary();
+    libSelected.clear();
+    items = [];
+    render();
+    await refreshLibrary();
+    await loadArchive();
+    await renderDataPage();
+    await refreshBadge();
+    setHint('评论库已经清空。设置没动，之前导出的备份文件也还在你自己的下载目录里。', 'warn');
+  } catch (e) {
+    setHint('清空失败：' + ((e && e.message) || e), 'bad');
+  } finally {
+    $('btn-data-clear').disabled = false;
   }
 }
 

@@ -52,7 +52,7 @@ const {
   removeLibItems, listLibItems, libraryStats, queryLib,
   saveVideoTitles, missingVideoTitles, videoKey,
   exportLibraryJSON, exportLibraryHTML, exportLibraryMarkdown, importLibraryJSON,
-  normalizeLibItem
+  normalizeLibItem, clearLibrary,
 } = shared;
 
 const item = (rpid, extra) => Object.assign({
@@ -453,6 +453,38 @@ await test('记录比导入可信：同一条被导入覆盖时来源不会被�
 
   const lib = await getLibrary();
   assert.equal(lib.items['111'].source, 'record', '来源不该被导入冲掉');
+});
+
+await test('查库：按来源筛选（自己记录 vs aicu 导入）', async () => {
+  localData.clear();
+  await upsertLibItems({ items: [
+    { rpid: '1', type: 1, oid: '555', state: 'live', source: 'record' },
+    { rpid: '2', type: 1, oid: '555', state: 'live', source: 'record' }
+  ] });
+  await upsertLibItems({ items: [item('3'), item('4'), item('5')] });   // 默认算导入
+
+  assert.equal((await queryLib({})).total, 5);
+  assert.equal((await queryLib({ source: 'record' })).total, 2);
+  assert.equal((await queryLib({ source: 'aicu' })).total, 3);
+  assert.equal((await queryLib({ source: '瞎写' })).total, 5, '来源不认识就当不筛');
+
+  // 来源和状态能一起用
+  await setLibStates({ 1: 'gone' });
+  assert.equal((await queryLib({ source: 'record', states: ['gone'] })).total, 1);
+});
+
+await test('clearLibrary：把整库清掉（数据页的「删除整个评论库」）', async () => {
+  localData.clear();
+  await upsertLibItems({ uid: 'u', items: [item('1'), item('2')] });
+  await saveVideoTitles({ [videoKey(1, '555')]: { title: '视频甲' } });
+  assert.equal((await libraryStats()).total, 2);
+
+  await clearLibrary();
+
+  const s = await libraryStats();
+  assert.equal(s.total, 0, '库要真的空掉');
+  assert.equal(s.videos, 0, '视频标题缓存跟着一起清');
+  assert.equal((await listLibItems()).length, 0);
 });
 
 /* ---------------------------------------------------------------- 汇总 */
