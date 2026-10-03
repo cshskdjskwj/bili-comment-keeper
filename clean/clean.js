@@ -202,6 +202,14 @@ function bindEvents() {
   });
   $('btn-aicu-autostop').addEventListener('click', stopAutoPage);
 
+  // 只读当前这一页（不翻页）。这是最重要的逃生口：
+  // 页面明明有评论、导入却一直是 0 的时候，点它试试 —— 它直接从渲染结果里抠，
+  // 完全不依赖「挂钩页面请求」那条路。
+  $('btn-aicu-read').addEventListener('click', function () {
+    if (running) return;
+    readCurrentAicuPage().catch(e => setAicuHint('读取失败：' + ((e && e.message) || e), 'bad'));
+  });
+
   $('btn-aicu-merge').addEventListener('click', function () {
     if (running) return;
     mergeAicu().catch(e => setAicuHint('加入失败：' + ((e && e.message) || e), 'bad'));
@@ -307,8 +315,8 @@ async function loadAicu() {
 
   const notes = [];
   if (!list.length) {
-    notes.push('还没有导入。打开 https://www.aicu.cc/reply?uid=你的UID 翻几页，' +
-      '或者直接点右边的「自动翻页抓取」让扩展替你翻。');
+    notes.push('还没有导入。打开 https://www.aicu.cc/reply?uid=你的UID 之后，' +
+      '点「自动翻页抓取」让它替你翻，或者点「读当前页」只把眼前这页捞进来。');
   } else {
     notes.push(`共 ${list.length} 条，其中 ${merged} 条已加入待删列表。`);
     notes.push('提醒：aicu.cc 只是索引，删除发生在 B 站；已删评论也可能仍留在它的存档里。');
@@ -424,8 +432,32 @@ async function sendToAicuTab(tabId, payload) {
   return false;
 }
 
-async function startAutoPage() {
-  if (autoRunning) return;
+/**
+ * 只让 aicu 页面把**当前这一页**已经渲染出来的评论读一遍，不翻页。
+ *
+ * 这是导入失灵时最重要的逃生口：它走的是「直接读渲染结果」那条路，
+ * 完全不依赖「挂钩页面请求」——所以页面明明有评论、导入却一直是 0 的时候，
+ * 点它基本都能立刻把数据捞回来。
+ */
+async function readCurrentAicuPage() {
+  let tab = null;
+  try { tab = await findAicuTab(); } catch (e) { /* 下面统一报 */ }
+
+  if (!tab) {
+    setAicuHint('没找到已打开的 aicu.cc 页面。先打开你自己的评论页（网址里带 uid=），再点这个按钮。', 'warn');
+    return;
+  }
+
+  const ok = await sendToAicuTab(tab.id, { action: 'harvest-once' });
+  if (!ok) {
+    setAicuHint('联系不上 aicu 页面里的脚本。把那个页面刷新一下（F5）再点 —— ' +
+      '最常见的原因是这个标签页在装/更新扩展之前就开着。', 'bad');
+    return;
+  }
+  setAicuHint('已经让 aicu 页面把当前这页的评论读一遍了，稍等一下…', '');
+}
+
+async function startAutoPage() {  if (autoRunning) return;
   if (running) { setAicuHint('正在删评论，等这一轮结束再抓取。', 'warn'); return; }
 
   let tab = null;

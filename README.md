@@ -68,9 +68,14 @@
 
 **从 Release 下载 zip 的话**：解压之后，**要选那个里面直接能看到 `manifest.json` 的文件夹**。
 Windows 的「解压全部」会按压缩包名建一层，所以正确的那层通常是
-`bili-comment-keeper-v1.1.0\`（里面就是 `manifest.json`、`src\`、`popup\`…）。
+`bili-comment-keeper-v1.2.2\`（里面就是 `manifest.json`、`src\`、`popup\`…）。
 
 选错了会报「**清单文件丢失或不可读取**」—— 那就是选到了外层，往里再点一层就好。
+
+> ⚠️ **升级时请对着 `chrome://extensions/` 里原来那一条点「重新加载」，不要重新下载 zip 再加载一遍。**
+> Chrome 给「已解压扩展」分配的 ID 是按**文件夹路径**算的 —— 换一个文件夹加载等于装了
+> 一个**全新的扩展**：书签还在（那是浏览器的数据），但 `chrome.storage.local` 里存的
+> **aicu 导入清单会从零开始**，工具栏角标也是新的一份。
 
 ### 它要了哪些权限？
 

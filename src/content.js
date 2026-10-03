@@ -32,6 +32,11 @@ window.addEventListener('message', function (ev) {
       sendToExtension({ type: 'AICU_REPLIES', payload: d.payload });
       return;
     }
+    if (d.__bcAicuDom && d.payload && typeof d.payload === 'object') {
+      // 第二条路：直接从渲染出来的列表里抠到的评论，同样交给后台去重落盘
+      sendToExtension({ type: 'AICU_REPLIES', payload: d.payload });
+      return;
+    }
     if (d.__bcAicuAuto && typeof d.__bcAicuAuto === 'object') {
       // 自动翻页抓取的进度/结束事件
       sendToExtension({ type: 'AICU_AUTOPAGE', payload: d.__bcAicuAuto });

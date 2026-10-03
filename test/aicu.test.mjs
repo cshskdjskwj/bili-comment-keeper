@@ -303,7 +303,34 @@ await test('全是被删过的条目时不会误报成功条数（added 为 0）
 const AICU_AUTO = readFileSync(fileURLToPath(new URL('../src/aicu-auto.js', import.meta.url)), 'utf8');
 
 /**
- * 造一个假的 aicu 页面：一个「下一页」按钮 + 一个会转发消息的 window。
+ * 造一张评论卡片的假 DOM。
+ * aicu 渲染出来的每条评论里有两个链接：
+ *   方式2 → .../h5/comment/sub?oid=&pageType=&root=   （oid 和 type 在这里）
+ *   方式0 → .../video/av{oid}#reply{rpid}            （rpid 在这里）
+ * 两者是同一个卡片里的兄弟节点。
+ */
+function makeCard(rpid, type, oid, root) {
+  const replyLink = {
+    getAttribute: n => n === 'href' ? `https://www.bilibili.com/video/av${oid}#reply${rpid}` : null
+  };
+  const subLink = {
+    getAttribute: n => n === 'href'
+      ? `https://www.bilibili.com/h5/comment/sub?oid=${oid}&pageType=${type}` +
+        `&root=${root === undefined ? rpid : root}`
+      : null,
+    parentElement: null
+  };
+  const card = {
+    querySelector: sel => (sel.indexOf('#reply') >= 0 ? replyLink : null),
+    parentElement: null
+  };
+  subLink.parentElement = { querySelector: () => null, parentElement: card };
+  return { subLink, replyLink, card };
+}
+
+/**
+ * 造一个假的 aicu 页面：一个「下一页」按钮 + 一个会转发消息的 window
+ * +（可选）已经渲染出来的评论卡片。
  * 按钮的 click 会模拟 aicu 的行为：翻到最后之后把自己变灰，并推一份新数据出来。
  */
 function makeAutoPage(opts = {}) {
@@ -312,6 +339,7 @@ function makeAutoPage(opts = {}) {
   const clickPostsData = opts.clickPostsData !== false;
 
   const reports = [];
+  const posts = [];
   const listeners = [];
   let clicks = 0;
   let vmWindow = null;   // 上下文里的 window（和外面这个 sandbox 引用并不相等）
@@ -329,16 +357,24 @@ function makeAutoPage(opts = {}) {
   };
 
   const buttons = hasNext ? [btn] : [];
+  const cards = opts.cards || [];
 
   const sandbox = {
     console, Promise, Number, String, Math, Date, Array, Object, isFinite,
-    setTimeout, clearTimeout,
-    document: { querySelectorAll: () => buttons },
-    location: { origin: 'https://www.aicu.cc', pathname: '/reply', search: '?uid=1' }
+    URL, URLSearchParams, setTimeout, clearTimeout,
+    document: {
+      querySelectorAll(sel) {
+        if (sel.indexOf('h5/comment/sub') >= 0) return cards.map(c => c.subLink);
+        if (sel.indexOf('MuiPaginationItem-next') >= 0 || sel.indexOf('next page') >= 0 || sel.indexOf('下一页') >= 0) return buttons;
+        return [];
+      }
+    },
+    location: { origin: 'https://www.aicu.cc', pathname: '/reply', search: opts.search || '?uid=1' }
   };
   sandbox.window = sandbox;
 
   function fire(data) {
+    posts.push(data);
     // 真实的 window.postMessage 会把 event.source 设成 window 自己。
     // 在 vm 里 window 是上下文代理对象，跟外面这个 sandbox 引用不相等，
     // 所以必须用「上下文里的那个 window」当 source，否则会被 ev.source !== window 挡掉。
@@ -353,7 +389,7 @@ function makeAutoPage(opts = {}) {
   vmWindow = vm.runInContext('window', sandbox);
   vm.runInContext(AICU_AUTO, sandbox, { filename: 'aicu-auto.js' });
 
-  return { sandbox, reports, fire, btn, clicks: () => clicks };
+  return { sandbox, reports, posts, fire, btn, clicks: () => clicks };
 }
 
 async function waitDone(reports, timeoutMs = 8000) {
@@ -446,7 +482,7 @@ await test('点了下一页却等不到新数据时说明原因并停下，不�
   const done = await waitDone(p.reports, 10000);
 
   assert.ok(done, '应该在等待超时后结束');
-  assert.match(done.reason, /没等到新数据/);
+  assert.match(done.reason, /既没有新请求/);
   assert.equal(p.clicks(), 1, '只该点一次就放弃');
 });
 
@@ -457,8 +493,87 @@ await test('首屏一直没数据（还在排队）时，也会停下并说明',
   const done = await waitDone(p.reports, 10000);
 
   assert.ok(done);
-  assert.match(done.reason, /没等到数据/);
+  assert.match(done.reason, /没读到评论/);
   assert.equal(p.clicks(), 0, '首屏都没数据就不该开始点');
+});
+
+await test('第二条路：直接从渲染出来的列表里抠出 rpid / type / oid', async () => {
+  const p = makeAutoPage({
+    cards: [makeCard('111', 1, '555'), makeCard('222', 12, '888')]
+  });
+
+  // 不翻页，只读当前页
+  p.fire({ __bcAicuCmd: { action: 'harvest-once' } });
+  await new Promise(r => setTimeout(r, 100));
+
+  const dom = p.posts.filter(m => m && m.__bcAicuDom);
+  assert.equal(dom.length, 1, '应该上报一次');
+
+  const items = dom[0].payload.items;
+  assert.equal(items.length, 2, `应该抠出 2 条，实际 ${items.length}`);
+
+  const first = JSON.parse(JSON.stringify(items[0]));
+  assert.equal(first.rpid, '111');
+  assert.equal(first.type, 1, 'pageType 就是删除要的 type');
+  assert.equal(first.oid, '555');
+  assert.equal(first.rank, 1, 'root 等于自己就是一级评论');
+  assert.equal(dom[0].payload.uid, '1', 'uid 从地址里取');
+});
+
+await test('第二条路：楼中楼能正确区分 root 与 rank', async () => {
+  const p = makeAutoPage({
+    cards: [makeCard('222', 1, '555', '111')]   // root=111 ≠ 自己 -> 楼中楼
+  });
+
+  p.fire({ __bcAicuCmd: { action: 'harvest-once' } });
+  await new Promise(r => setTimeout(r, 100));
+
+  const it = JSON.parse(JSON.stringify(p.posts.find(m => m && m.__bcAicuDom).payload.items[0]));
+  assert.equal(it.rpid, '222');
+  assert.equal(it.root, '111', 'root 要原样带出来');
+  assert.equal(it.rank, 2, 'root 不等于自己 -> 楼中楼');
+});
+
+await test('网络钩子完全失灵时，靠读页面照样能把评论导进来', async () => {
+  // clickPostsData: false —— 模拟 aicu-main.js 那条钩子一点动静都没有
+  const p = makeAutoPage({
+    totalClicks: 5,
+    clickPostsData: false,
+    cards: [makeCard('111', 1, '555'), makeCard('222', 1, '556')]
+  });
+
+  // 注意：这里故意不喂任何 __bcAicu，模拟"钩子压根没装上"
+  p.fire({ __bcAicuCmd: { action: 'autopage-start', maxPages: 10, gapMs: 300, waitMs: 1500, firstWaitMs: 1500 } });
+  const done = await waitDone(p.reports, 12000);
+
+  const dom = p.posts.filter(m => m && m.__bcAicuDom);
+  assert.ok(dom.length >= 1, '页面里明明有评论，就该从渲染结果里读到并上报');
+  const rpids = dom.flatMap(m => m.payload.items.map(i => i.rpid));
+  assert.ok(rpids.includes('111') && rpids.includes('222'), `实际读到：${rpids.join(', ')}`);
+  assert.ok(done, '应该有个明确的收场');
+});
+
+await test('判断"翻页有没有生效"看的是新 rpid，不是本页条数', async () => {
+  // 每页都是同样 2 条（条数不变），但内容不同 —— 不能因此误判成"没变化"而提前收工
+  let page = 0;
+  const cardsFor = n => [makeCard(String(n * 10 + 1), 1, '555'), makeCard(String(n * 10 + 2), 1, '556')];
+
+  const p = makeAutoPage({ totalClicks: 3, clickPostsData: false, cards: cardsFor(1) });
+  p.sandbox.document.querySelectorAll = function (sel) {
+    if (sel.indexOf('h5/comment/sub') >= 0) return cardsFor(page + 1).map(c => c.subLink);
+    if (sel.indexOf('MuiPaginationItem-next') >= 0 || sel.indexOf('next page') >= 0 || sel.indexOf('下一页') >= 0) {
+      return [p.btn];
+    }
+    return [];
+  };
+  p.btn.click = function () { page++; if (page >= 2) p.btn.disabled = true; };
+
+  p.fire({ __bcAicuCmd: { action: 'autopage-start', maxPages: 10, gapMs: 300, waitMs: 700, firstWaitMs: 700 } });
+  const done = await waitDone(p.reports, 15000);
+
+  assert.ok(done);
+  const rpids = new Set(p.posts.filter(m => m && m.__bcAicuDom).flatMap(m => m.payload.items.map(i => i.rpid)));
+  assert.ok(rpids.size >= 4, `页数变了就该继续翻，实际只读到 ${rpids.size} 个不同 rpid`);
 });
 
 await test('抓取期间重复发开始指令会被忽略，不会跑成两份', async () => {
