@@ -379,6 +379,45 @@ await test('checkAliveOne：拿不准时返回 null 而不是 false', async () =
   assert.equal(r.alive, null);
 });
 
+await test('注入永不 settle 时也必须返回 —— 绝不能静默卡死（线上真实事故）', async () => {
+  // 事故现场：点了「探测存活」之后界面一动不动、风扇狂转、连「停止」都没反应。
+  // 根因是 await chrome.scripting.executeScript(...) 永不 settle，
+  // 于是 Promise.race 里的总超时**根本执行不到**。这条用例就是钉住这个回归。
+  const { sandbox } = await makeSandbox(async () => new Promise(function () { /* 永远不 settle */ }));
+  sandbox.BC_DELETE_TIMEOUT_MS = 2500;
+
+  const t0 = Date.now();
+  const r = await sandbox.deleteOne(1, { type: 1, oid: '5', rpid: '9' });
+  const took = Date.now() - t0;
+
+  assert.equal(r.ok, false);
+  assert.match(r.message, /等待页面响应超时/, `实际：${r.message}`);
+  assert.ok(took < 8000, `必须在总超时内返回，实际 ${took}ms`);
+});
+
+await test('注入永不 settle 时，探测也一样会返回', async () => {
+  const { sandbox } = await makeSandbox(async () => new Promise(function () { /* 永远不 settle */ }));
+
+  const t0 = Date.now();
+  const r = await sandbox.checkAliveOne(1, { type: 1, oid: '5', rpid: '9' });
+  const took = Date.now() - t0;
+
+  assert.equal(r.alive, null, '拿不准就是 null，不能卡住也不能误判');
+  assert.ok(took < 20000, `必须返回，实际 ${took}ms`);
+});
+
+await test('withTimeout：到点就返回兜底值', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+
+  const t0 = Date.now();
+  const v = await sandbox.withTimeout(new Promise(function () {}), 400, '兜底');
+  assert.equal(v, '兜底');
+  assert.ok(Date.now() - t0 < 3000);
+
+  const fast = await sandbox.withTimeout(Promise.resolve('正常'), 5000, '兜底');
+  assert.equal(fast, '正常', '正常返回时不该动它');
+});
+
 /* ---------------------------------------------------------------- 汇总 */
 
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项\n`);

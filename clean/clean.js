@@ -167,6 +167,22 @@ var BC_DELETE_TIMEOUT_MS = 23000;
 /** 自检里等「兜底通道回话」的时长；同样用 var 方便测试调小。 */
 var BC_PREFLIGHT_MS = 6000;
 
+/**
+ * 给任何 await 套一个硬上限。
+ *
+ * 这一条是被真实事故逼出来的：探测功能上线后，有人点了「探测存活」，界面一动不动、
+ * 风扇狂转、连「停止」都没反应。根因是某一步 await（最可能是 executeScript）
+ * **永远不 settle** —— 于是 Promise.race 里的总超时压根执行不到，整个流程静默卡死。
+ *
+ * 教训：不能只在最后加一个 race 就以为万无一失，**每一个可能卡住的 await 都得自己带上限**。
+ */
+function withTimeout(promise, ms, fallback) {
+  return Promise.race([
+    promise,
+    sleep(ms).then(function () { return fallback; })
+  ]);
+}
+
 let running = false, stopRequested = false;
 let workerTabId = null, workerCreated = false;
 let settings = null, activeFolderId = null, deletedFolderId = null;
@@ -597,12 +613,25 @@ async function probeAicuAlive() {
     if (probeStop) break;
 
     const it = todo[i];
-    const r = await checkAliveOne(tabId, it);
+    const startedAt = Date.now();
+
+    // 每条都带上限。外层再兜一层，是为了"就算 checkAliveOne 本身出了意料之外的问题，
+    // 循环也一定能往下走" —— 这个功能已经因为一处不 settle 的 await 卡死过一次了。
+    let r = { alive: null, message: '内部超时' };
+    try {
+      r = await withTimeout(checkAliveOne(tabId, it), 14000, { alive: null, message: '这条探测超时（14 秒）' });
+    } catch (e) {
+      r = { alive: null, message: '探测出错：' + ((e && e.message) || e) };
+    }
+
+    const took = Date.now() - startedAt;
 
     if (r.tabGone) {
+      log(`探测 ${i + 1}/${todo.length}：通道标签页失效，正在换一个…`);
       workerTabId = null;
       workerCreated = false;
-      try { tabId = await acquireWorkerTab(); } catch (e) { /* 下一轮再试 */ }
+      try { tabId = await withTimeout(acquireWorkerTab(), 12000, null); } catch (e) { /* 下一轮再试 */ }
+      if (!tabId) { setAicuHint('通道标签页打不开了，探测已中止。', 'bad'); break; }
       unknown++;
     } else if (r.alive === true) {
       alive++; marks[it.rpid] = true; errStreak = 0;
@@ -610,6 +639,8 @@ async function probeAicuAlive() {
       gone++; marks[it.rpid] = false; errStreak = 0;
     } else {
       unknown++;
+      // 把"问不出来"的原因写进日志，不然只剩一个数字，没法排查
+      log(`探测 ${i + 1}/${todo.length} rpid ${it.rpid}：没问出结果（${took} 毫秒，${r.message || '无说明'}）`);
       // 连续问不出结果，多半是触发风控了，歇一会儿
       if (++errStreak >= 3) {
         errStreak = 0;
@@ -618,11 +649,10 @@ async function probeAicuAlive() {
       }
     }
 
-    if (i % 5 === 0 || i === todo.length - 1) {
-      await flush();
-      setAicuHint(`探测中 ${i + 1}/${todo.length} —— 还在 ${alive} 条，`
-        + `已经没了 ${gone} 条，没问出结果 ${unknown} 条。（只读，不会删东西）`, '');
-    }
+    // 每条都刷新一次，别让人以为卡住了；顺便报一下上一条花了多久
+    await flush();
+    setAicuHint(`探测中 ${i + 1}/${todo.length}（上一条 ${took} 毫秒）—— 还在 ${alive} 条，`
+      + `已经没了 ${gone} 条，没问出结果 ${unknown} 条。（只读，不会删东西）`, '');
 
     if (i < todo.length - 1) await sleep(BC_PROBE_DELAY_MS);
   }
@@ -1022,11 +1052,12 @@ async function getWorkerTab() {
     try { await chrome.tabs.get(workerTabId); return workerTabId; } catch (e) { workerTabId = null; }
   }
 
-  const tabs = await chrome.tabs.query({ url: 'https://*.bilibili.com/*' });
-  const usable = tabs.find(t => t.id !== undefined && t.id !== null && !t.discarded);
+  const tabs = await withTimeout(chrome.tabs.query({ url: 'https://*.bilibili.com/*' }), 8000, []);
+  const usable = (tabs || []).find(t => t.id !== undefined && t.id !== null && !t.discarded);
   if (usable) { workerTabId = usable.id; workerCreated = false; return workerTabId; }
 
-  const tab = await chrome.tabs.create({ url: 'https://www.bilibili.com/', active: false });
+  const tab = await withTimeout(chrome.tabs.create({ url: 'https://www.bilibili.com/', active: false }), 8000, null);
+  if (!tab) throw new Error('打开 bilibili 标签页时卡住了');
   workerTabId = tab.id;
   workerCreated = true;
   await waitTabComplete(tab.id, 25000);
@@ -1037,7 +1068,7 @@ async function getWorkerTab() {
 async function acquireWorkerTab() {
   if (workerTabId !== null) {
     try {
-      await chrome.tabs.get(workerTabId);
+      await withTimeout(chrome.tabs.get(workerTabId), 5000, null);
       return workerTabId;
     } catch (e) {
       workerTabId = null;      // 用户把它关了
@@ -1073,14 +1104,19 @@ async function runInjected(tabId, fn, arg, timeoutMs) {
       await sleep(500);
       let out;
       try {
-        out = await chrome.scripting.executeScript({
-          target: { tabId: tabId },
-          world: 'MAIN',
-          func: function (id) {
-            return (window.__bcDelResults && window.__bcDelResults[id]) || null;
-          },
-          args: [requestId]
-        });
+        // 每一次轮询也带上限：某一次 executeScript 卡住不能把整条流程拖死
+        out = await withTimeout(
+          chrome.scripting.executeScript({
+            target: { tabId: tabId },
+            world: 'MAIN',
+            func: function (id) {
+              return (window.__bcDelResults && window.__bcDelResults[id]) || null;
+            },
+            args: [requestId]
+          }),
+          4000,
+          null
+        );
       } catch (e) {
         // 页面被关了 / 被导航走了
         return { ok: false, tabGone: true, message: '读取页面结果失败：' + ((e && e.message) || e) };
@@ -1101,23 +1137,37 @@ async function runInjected(tabId, fn, arg, timeoutMs) {
     return { ok: false, message: '等待页面响应超时（' + Math.round(OVERALL_MS / 1000) + ' 秒）' };
   });
 
+  // 注入本身也必须有上限 —— 这一步不 settle 的话，下面的 race 根本执行不到
+  let injectedOut = null;
+  let injectFailed = null;
   try {
-    const out = await chrome.scripting.executeScript({
-      target: { tabId: tabId },
-      world: 'MAIN',
-      func: fn,
-      args: [payload]
-    });
+    injectedOut = await withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId: tabId },
+        world: 'MAIN',
+        func: fn,
+        args: [payload]
+      }),
+      OVERALL_MS,
+      null                    // null = 注入本身就超时了
+    );
+  } catch (e) {
+    injectFailed = e;
+  }
+
+  if (injectFailed) {
+    pending.delete(requestId);
+    // 最常见的原因是通道标签页被关掉了，标记出来交给调用方换一个重试
+    return { ok: false, tabGone: true, message: '注入网页失败：' + ((injectFailed && injectFailed.message) || injectFailed) };
+  }
+
+  if (injectedOut) {
     // 同步返回（没走 async）时这里就能直接拿到结果
-    const r = out && out[0] && out[0].result;
+    const r = injectedOut[0] && injectedOut[0].result;
     if (r && r.requestId === requestId) {
       pending.delete(requestId);
       return r;
     }
-  } catch (e) {
-    pending.delete(requestId);
-    // 最常见的原因是通道标签页被关掉了，标记出来交给调用方换一个重试
-    return { ok: false, tabGone: true, message: '注入网页失败：' + ((e && e.message) || e) };
   }
 
   const r = await Promise.race([viaPoll, viaMessage, overallTimeout]);
@@ -1135,8 +1185,9 @@ async function deleteOne(tabId, target) {
 
 /** 只读地探测一条还在不在。返回 { alive: true|false|null, message, tabGone? } */
 async function checkAliveOne(tabId, item) {
+  // 只读查询本来就快，给 10 秒足够；短一点还有一个好处：点「停止」时等待更短
   const r = await runInjected(tabId, mainWorldCheck,
-    { type: item.type, oid: item.oid, rpid: item.rpid }, 20000);
+    { type: item.type, oid: item.oid, rpid: item.rpid }, 10000);
   if (r.tabGone) return { alive: null, tabGone: true, message: r.message };
   return {
     alive: (r.alive === true || r.alive === false) ? r.alive : null,
@@ -1185,16 +1236,24 @@ async function preflight(tabId) {
   // 第一关：能不能注入、页面里读不读得到登录态
   let probe;
   try {
-    probe = await chrome.scripting.executeScript({
-      target: { tabId: tabId },
-      world: 'MAIN',
-      func: function () {
-        const m = /(?:^|;\s*)bili_jct=([^;]+)/.exec(document.cookie || '');
-        return { hasJct: !!m, href: location.href, ready: document.readyState };
-      }
-    });
+    probe = await withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId: tabId },
+        world: 'MAIN',
+        func: function () {
+          const m = /(?:^|;\s*)bili_jct=([^;]+)/.exec(document.cookie || '');
+          return { hasJct: !!m, href: location.href, ready: document.readyState };
+        }
+      }),
+      8000,
+      null
+    );
   } catch (e) {
     return { ok: false, reason: '往那个 bilibili 标签页注入脚本失败：' + ((e && e.message) || e) };
+  }
+
+  if (!probe) {
+    return { ok: false, reason: '往那个 bilibili 标签页注入脚本时卡住了（8 秒没回应）。把那个页面刷新一下再试。' };
   }
 
   const info = probe && probe[0] && probe[0].result;
@@ -1215,14 +1274,18 @@ async function preflight(tabId) {
       if (pending.has(requestId)) { pending.delete(requestId); resolve(false); }
     }, Number(BC_PREFLIGHT_MS) || 6000);
 
-    chrome.scripting.executeScript({
-      target: { tabId: tabId },
-      world: 'MAIN',
-      func: function (id) {
-        window.postMessage({ __bcDeleterResult: { requestId: id, ok: true, code: 0, message: '自检' } }, '*');
-      },
-      args: [requestId]
-    }).catch(function () { /* 下面按超时处理 */ });
+    withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId: tabId },
+        world: 'MAIN',
+        func: function (id) {
+          window.postMessage({ __bcDeleterResult: { requestId: id, ok: true, code: 0, message: '自检' } }, '*');
+        },
+        args: [requestId]
+      }),
+      4000,
+      null
+    ).catch(function () { /* 下面按超时处理 */ });
   });
 
   if (!arrived) {
@@ -1350,7 +1413,7 @@ async function start() {
     it.note = '';
     renderRow(it);
 
-    const t = await resolveTarget(it);
+    const t = await withTimeout(resolveTarget(it), 20000, { error: '定位这条评论超时（20 秒）' });
     let r = null;
 
     if (t.error) {
@@ -1359,12 +1422,15 @@ async function start() {
       stats.fail++;
       logError('✗ ' + label(it) + ' → ' + t.error);
     } else {
-      r = await attemptDelete(t);
+      // 每条删除也带上限：一处 await 不 settle 不能把整轮拖死（这个坑真踩过）
+      r = await withTimeout(attemptDelete(t), 30000,
+        { ok: false, code: null, message: '这条处理超时（30 秒）' });
 
       if (r.code === -509) {
         log('  ↻ 触发风控限流（-509），等 15 秒后重试一次…');
         await sleep(15000);
-        r = await attemptDelete(t);
+        r = await withTimeout(attemptDelete(t), 30000,
+          { ok: false, code: null, message: '这条重试也超时了（30 秒）' });
       }
 
       if (r.ok || r.code === 12022) {
