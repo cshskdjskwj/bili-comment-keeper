@@ -195,7 +195,7 @@ const shared = await import('../src/shared.js');
 const {
   normalizeAicuItem, aicuPageUrl, aicuTypeName,
   mergeAicuItems, listAicuItems, removeAicuItems, clearAicuStore, getAicuStore,
-  markAicuAlive
+  markAicuAlive, aicuCommentUrl, parseCommentUrl, buildTitle
 } = shared;
 
 const item = (rpid, over) => Object.assign({
@@ -676,6 +676,61 @@ await test('存活探测：重新导入（补全正文）不会把已有的 aliv
   assert.equal(store.items['1'].message, '补上的正文', '正文应该被补上');
   assert.equal(store.items['1'].ctime, 1700000000, '时间应该被补上');
   assert.equal(store.items['1'].alive, false, 'alive 是探测的结论，不能被重新导入冲掉');
+});
+
+await test('存进收藏夹的 URL：解析回来必须还是同一条评论（一级评论）', async () => {
+  // 这是整个导出功能最关键的不变量：拼出来的 URL 一旦解析岔了，
+  // 存进收藏夹之后就会删错评论。
+  const it = { rpid: '317447018496', type: 1, oid: '117267354356619', root: '0', rank: 1 };
+  const url = aicuCommentUrl(it);
+  assert.ok(url, '应该拼得出地址');
+
+  const back = parseCommentUrl(url);
+  assert.ok(back, '拼出来的地址必须能被解析回来');
+  assert.equal(back.rpid, it.rpid, 'rpid 必须一模一样');
+  assert.equal(back.isSecondary, false, '一级评论不该被当成楼中楼');
+  assert.equal(back.rootId, it.rpid, '一级评论的 root 就是它自己');
+  assert.match(back.pageUrl, /av117267354356619/, '要指回原视频');
+});
+
+await test('存进收藏夹的 URL：楼中楼要区分「本人」和「会话根」', async () => {
+  // 样本2 的形状：二级评论 999，所属会话的根是 316906615664
+  const it = { rpid: '999', type: 11, oid: '408598859', root: '316906615664', rank: 2 };
+  const url = aicuCommentUrl(it);
+  const back = parseCommentUrl(url);
+
+  assert.equal(back.rpid, '999', 'rpid 必须是二级评论本人，不是会话根');
+  assert.equal(back.isSecondary, true, '要认得出这是楼中楼');
+  assert.equal(back.rootId, '316906615664', '会话根也要保留');
+});
+
+await test('存进收藏夹的 URL：按类型指到对的地方', async () => {
+  const video = aicuCommentUrl({ rpid: '1', type: 1, oid: '555', root: '0', rank: 1 });
+  assert.match(video, /bilibili\.com\/video\/av555/);
+
+  const read = aicuCommentUrl({ rpid: '1', type: 12, oid: '888', root: '0', rank: 1 });
+  assert.match(read, /bilibili\.com\/read\/cv888/);
+
+  const dyn = aicuCommentUrl({ rpid: '1', type: 17, oid: '777', root: '0', rank: 1 });
+  assert.match(dyn, /t\.bilibili\.com\/777/);
+});
+
+await test('存进收藏夹的 URL：缺关键字段就返回空串，不能拼出半截地址', async () => {
+  assert.equal(aicuCommentUrl({ rpid: 'abc', type: 1, oid: '555' }), '');
+  assert.equal(aicuCommentUrl({ rpid: '1', type: 1, oid: '' }), '');
+  assert.equal(aicuCommentUrl(null), '');
+});
+
+await test('存进收藏夹的 URL：书签标题能正常生成（复用同一套 buildTitle）', async () => {
+  const it = { rpid: '317447018496', type: 1, oid: '117267354356619', root: '0', rank: 1 };
+  const url = aicuCommentUrl(it);
+  const back = parseCommentUrl(url);
+  const title = buildTitle({
+    ctime: 1700000000, pageUrl: back.pageUrl, url: url, message: '这条还活着', isSecondary: back.isSecondary
+  });
+  assert.match(title, /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\] /);
+  assert.match(title, /av117267354356619/);
+  assert.match(title, /这条还活着/);
 });
 
 /* ---------------------------------------------------------------- 汇总 */

@@ -8,9 +8,10 @@
  */
 
 import {
-  getSettings, getIndex, setIndex, ensureFolder, findFolder, buildTitle,
-  parseCommentUrl, isBiliUrl, listBookmarks, listComments, mergeAicuItems,
-  getAicuStore, K_SETTINGS
+  getSettings, getIndex, setIndex, ensureFolder, findFolder, buildTitle, parseCommentUrl,
+  isBiliUrl, listBookmarks, listComments, mergeAicuItems,
+  getAicuStore, K_SETTINGS,
+  normalizeAicuItem, aicuCommentUrl, aicuPageUrl
 } from './shared.js';
 
 /* ------------------------------------------------------------------ 记录 */
@@ -21,6 +22,13 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
       .then(function (r) { sendResponse(r); })
       .catch(function (e) { sendResponse({ ok: false, reason: String((e && e.message) || e) }); });
     return true; // 异步回复
+  }
+  if (msg && msg.type === 'AICU_TO_BOOKMARKS') {
+    // 要写索引，所以和记录走同一把锁
+    withIndexLock(function () { return handleAicuToBookmarks(msg.payload); })
+      .then(function (r) { sendResponse(r); })
+      .catch(function (e) { sendResponse({ ok: false, reason: String((e && e.message) || e) }); });
+    return true;
   }
   if (msg && msg.type === 'COMMENT_DELETED') {
     withIndexLock(function () { return handleDeleted(msg.payload); })
@@ -191,6 +199,48 @@ async function handleRecord(payload) {
   await updateBadge();
 
   return { ok: true, title: title, url: info.url };
+}
+
+/* -------------------------------------------------- 把 aicu 的存活条目存进收藏夹
+ * aicu 导进来的是「历史评论」，它们本来就不在收藏夹里。探测出还活着的那批，
+ * 用和扩展自己记录时**完全一样的格式**存进收藏夹 —— 之后角标、归档、删除
+ * 全都按同一套逻辑走，不用为它们开小灶。
+ */
+async function handleAicuToBookmarks(payload) {
+  const settings = await getSettings();
+  if (!settings.enabled) return { ok: false, reason: '扩展已停用，先在设置里打开' };
+
+  const list = (payload && payload.items) || [];
+  let created = 0, existed = 0, failed = 0;
+  const saved = [];
+
+  for (const raw of list) {
+    const item = normalizeAicuItem(raw);
+    if (!item) { failed++; continue; }
+
+    const url = aicuCommentUrl(item);
+    if (!url) { failed++; continue; }
+
+    const r = await handleRecord({
+      url: url,
+      type: item.type,
+      oid: item.oid,
+      pageUrl: aicuPageUrl(item.type, item.oid),
+      message: item.message,
+      ctime: item.ctime,
+      source: 'aicu'
+    });
+
+    if (r && r.ok) {
+      if (r.duplicated) existed++; else created++;
+      saved.push(item.rpid);
+    } else {
+      failed++;
+    }
+  }
+
+  await updateBadge();
+  return { ok: true, created: created, existed: existed, failed: failed, saved: saved };
 }
 
 /* -------------------------------------------------- 手动删除的同步归档

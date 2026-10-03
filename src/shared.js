@@ -391,6 +391,34 @@ export function aicuPageUrl(type, oid) {
   }
 }
 
+/**
+ * 用 aicu 记录的 type / oid / root / rank 拼一条**和扩展自己记录时完全同款**的评论地址。
+ *
+ * 这一点很关键：只要格式一致，parseCommentUrl 就能原样解析回来（含楼中楼），
+ * 这些条目存进收藏夹之后，角标、归档、删除全都按同一套逻辑走，不用为它们开小灶。
+ */
+export function aicuCommentUrl(item) {
+  if (!item) return '';
+  const rpid = String(item.rpid || '');
+  if (!/^\d+$/.test(rpid)) return '';
+
+  const base = aicuPageUrl(item.type, item.oid);
+  if (!base) return '';
+
+  const root = String(item.root || '0');
+  const isSecondary = Number(item.rank) === 2 || (root !== '0' && root !== rpid);
+
+  let u;
+  try { u = new URL(base); } catch (e) { return ''; }
+  u.searchParams.set('comment_on', '1');
+  // 一级评论：root 就是它自己；楼中楼：root 是所属会话的根，本人另写在 secondary 里
+  u.searchParams.set('comment_root_id', root !== '0' ? root : rpid);
+  if (isSecondary) u.searchParams.set('comment_secondary_id', rpid);
+  u.searchParams.set('share_type', 's_i');
+
+  return u.toString() + '#reply' + rpid;
+}
+
 /** 规整一条 aicu 记录；缺关键字段（rpid / type / oid）就返回 null */
 export function normalizeAicuItem(raw) {
   if (!raw || typeof raw !== 'object') return null;

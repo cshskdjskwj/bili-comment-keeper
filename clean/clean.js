@@ -295,6 +295,16 @@ function bindEvents() {
     readCurrentAicuPage().catch(e => setAicuHint('读取失败：' + ((e && e.message) || e), 'bad'));
   });
 
+  // 把还活着的存进收藏夹 —— 存进去之后它们就是正式记录了
+  $('btn-aicu-bookmark').addEventListener('click', function () {
+    saveAicuToBookmarks().catch(e => setAicuHint('存入收藏夹失败：' + ((e && e.message) || e), 'bad'));
+  });
+
+  // 清掉已确认没了的，清单里只留活着的
+  $('btn-aicu-prune').addEventListener('click', function () {
+    pruneDeadAicu().catch(e => setAicuHint('清理失败：' + ((e && e.message) || e), 'bad'));
+  });
+
   $('btn-aicu-merge').addEventListener('click', function () {
     if (running) return;
     mergeAicu().catch(e => setAicuHint('加入失败：' + ((e && e.message) || e), 'bad'));
@@ -523,10 +533,80 @@ function refreshAicuButtons() {
   $('btn-aicu-auto').classList.toggle('hide', autoRunning || probing);
   $('btn-aicu-probe').classList.toggle('hide', autoRunning || probing);
   $('btn-aicu-autostop').classList.toggle('hide', !(autoRunning || probing));
-  for (const id of ['btn-aicu-read', 'btn-aicu-merge', 'btn-aicu-clear']) {
+  for (const id of ['btn-aicu-read', 'btn-aicu-merge', 'btn-aicu-clear', 'btn-aicu-bookmark', 'btn-aicu-prune']) {
     const el = $(id);
     if (el) el.disabled = busy;
   }
+}
+
+/**
+ * 把还活着的条目存进收藏夹。
+ *
+ * 收藏夹是这个扩展的"账本"：角标、归档、删除全都围着它转。aicu 导进来的是历史评论，
+ * 本来不在账本里；探测出还活着的那批存进去之后，它们就和其他记录完全一样了。
+ * URL 用的是 parseCommentUrl 能原样解析回来的格式（含楼中楼）。
+ */
+async function saveAicuToBookmarks() {
+  if (running || probing || autoRunning) return;
+
+  const list = await listAicuItems();
+  const pick = list.filter(i => i.alive !== false);   // 确认没了的就别存了
+  if (!pick.length) {
+    setAicuHint(list.length
+      ? '没有可存的：清单里全是已经确认没了的。'
+      : '清单是空的，先去 aicu.cc 导入。', 'warn');
+    return;
+  }
+
+  const untested = pick.filter(i => i.alive === undefined).length;
+  if (untested) {
+    setAicuHint(`正在存入收藏夹…（其中 ${untested} 条还没探测过，一并存入）`, '');
+  } else {
+    setAicuHint(`正在把 ${pick.length} 条存进收藏夹…`, '');
+  }
+
+  let r;
+  try {
+    r = await chrome.runtime.sendMessage({
+      type: 'AICU_TO_BOOKMARKS',
+      payload: { items: pick }
+    });
+  } catch (e) {
+    setAicuHint('存入收藏夹失败：' + ((e && e.message) || e), 'bad');
+    return;
+  }
+
+  if (!r || !r.ok) {
+    setAicuHint('存入收藏夹失败：' + ((r && r.reason) || '后台没有应答'), 'bad');
+    return;
+  }
+
+  // 已经进了收藏夹的那批，就从导入清单里摘掉 —— 它们有正式身份了，不用留副本
+  const saved = r.saved || [];
+  if (saved.length) await removeAicuItems(saved);
+  await loadAicu();
+
+  const parts = [`已存入收藏夹 ${r.created} 条`];
+  if (r.existed) parts.push(`${r.existed} 条本来就在收藏夹里`);
+  if (r.failed) parts.push(`${r.failed} 条没能存入`);
+  setAicuHint(parts.join('，') + '。它们现在和手动记录的评论一样，会出现在上面主列表里，' +
+    '也计入角标。', r.failed ? 'warn' : '');
+}
+
+/** 把「已确认没了」的条目从导入清单里删掉，只留活着的 */
+async function pruneDeadAicu() {
+  if (running || probing || autoRunning) return;
+
+  const list = await listAicuItems();
+  const dead = list.filter(i => i.alive === false);
+  if (!dead.length) {
+    setAicuHint('没有「已确认没了」的条目要清。先点「探测存活」筛一遍。', 'warn');
+    return;
+  }
+
+  await removeAicuItems(dead.map(i => i.rpid));
+  await loadAicu();
+  setAicuHint(`已经清掉 ${dead.length} 条确认没了的，清单里只剩 ${list.length - dead.length} 条。`, '');
 }
 
 /**

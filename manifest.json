@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "B站评论管家",
   "short_name": "评论管家",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "自动记录自己在 B 站发布的每条评论链接并存入书签栏，支持一键批量删除、把已删链接原样归档，并可导入 aicu.cc 的历史评论补删。",
   "author": "cshskdjskwj",
   "homepage_url": "https://github.com/cshskdjskwj/bili-comment-keeper",
