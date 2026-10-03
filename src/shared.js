@@ -470,118 +470,48 @@ export function normalizeAicuItem(raw) {
   return out;
 }
 
-const EMPTY_AICU = { uid: '', total: 0, updatedAt: 0, mixed: false, items: {} };
+/* 老接口：全部转发到「库」上
+ *
+ * v1.5 把权威数据源换成了库（见下一节）。这些是 v1.4 及以前的入口，保留下来
+ * 是为了让调用方不用一次性全改 —— 但它们**只是转发**，不再是独立的一份数据。
+ * 否则会出现"探测写库、列表读老表"这种数据分裂。
+ */
 
 export async function getAicuStore() {
-  const o = await chrome.storage.local.get(K_AICU);
-  const s = o[K_AICU];
-  if (!s || typeof s !== 'object') return Object.assign({}, EMPTY_AICU, { items: {} });
+  const lib = await getLibrary();
   return {
-    uid: String(s.uid || ''),
-    total: Number(s.total) || 0,
-    updatedAt: Number(s.updatedAt) || 0,
-    mixed: !!s.mixed,
-    items: (s.items && typeof s.items === 'object') ? s.items : {}
+    uid: lib.uid,
+    mixed: lib.mixed,
+    total: lib.total,
+    updatedAt: lib.updatedAt,
+    items: lib.items,
+    videos: lib.videos
   };
 }
 
-/** 合并一批刚抓到的评论（按 rpid 去重）；返回本次新增与累计条数 */
+export async function listAicuItems() {
+  return await listLibItems();
+}
+
 export async function mergeAicuItems(payload) {
-  const incomingUid = String((payload && payload.uid) || '');
-  const list = Array.isArray(payload && payload.items) ? payload.items : [];
+  const r = await upsertLibItems(payload);
+  return { added: r.added, enriched: r.enriched, total: r.total, capped: false, store: r.store };
+}
 
-  const store = await getAicuStore();
-  const next = {
-    uid: incomingUid || store.uid,
-    total: Number(payload && payload.total) || store.total,
-    updatedAt: Date.now(),
-    // 换了 uid 也照收（按约定只警告不拦），但把这件事记下来让界面能提示
-    mixed: store.mixed || !!(store.uid && incomingUid && store.uid !== incomingUid),
-    items: Object.assign({}, store.items)
-  };
+/** 标记存活结论；返回**结论真的变了**的条数（老接口的返回值就是个数） */
+export async function markAicuAlive(marks) {
+  const r = await setLibStates(marks);
+  return r.changed;
+}
 
-  let added = 0;
-  let enriched = 0;
-  let capped = false;
-  let count = Object.keys(next.items).length;   // 计数放在循环外，避免 O(n²)
-
-  for (const raw of list) {
-    const item = normalizeAicuItem(raw);
-    if (!item) continue;
-
-    const prev = next.items[item.rpid];
-    if (prev) {
-      // 已有的条目可能只有 rpid/type/oid（比如从 DOM 抠的，当时没读到正文和时间）。
-      // 这次拿到了更全的信息就补上 —— 否则那批条目会永远显示成「时间未知 · 评论」。
-      const patch = {};
-      if (!prev.message && item.message) patch.message = item.message;
-      if (!prev.ctime && item.ctime) patch.ctime = item.ctime;
-      if (!prev.type && item.type) patch.type = item.type;
-      if (!prev.oid && item.oid) patch.oid = item.oid;
-      if ((!prev.root || prev.root === '0') && item.root && item.root !== '0') patch.root = item.root;
-      if (Object.keys(patch).length) {
-        next.items[item.rpid] = Object.assign({}, prev, patch);
-        enriched++;
-      }
-      continue;
-    }
-
-    if (count >= AICU_MAX_ITEMS) { capped = true; break; }
-    next.items[item.rpid] = item;
-    count++;
-    added++;
-  }
-
-  if (added || enriched) await chrome.storage.local.set({ [K_AICU]: next });
-  return { added: added, enriched: enriched, total: count, capped: capped, store: next };
+export async function removeAicuItems(rpids) {
+  return await removeLibItems(rpids);
 }
 
 export async function clearAicuStore() {
-  await chrome.storage.local.remove(K_AICU);
+  // 连老的 bc_aicu 一起清掉：否则下次读库会把它当成"还没迁移过"again 迁回来
+  await chrome.storage.local.remove([K_LIBRARY, K_AICU]);
 }
-
-/**
- * 记下存活探测的结果。
- * marks 形如 { rpid: true|false }；true=还在，false=已经没了。
- * 只标不改别的字段，也不删条目 —— 保留 `false` 是为了让你看得见"总共筛掉了多少"。
- */
-export async function markAicuAlive(marks) {
-  const store = await getAicuStore();
-  let changed = 0;
-  for (const rpid of Object.keys(marks || {})) {
-    const it = store.items[rpid];
-    if (!it) continue;
-    if (it.alive === marks[rpid]) continue;
-    it.alive = marks[rpid];
-    changed++;
-  }
-  if (changed) await chrome.storage.local.set({ [K_AICU]: store });
-  return changed;
-}
-
-/** 删成功的评论从导入清单里移除，免得它一直挂在面板上 */
-export async function removeAicuItems(rpids) {
-  const list = Array.isArray(rpids) ? rpids.map(String) : [];
-  if (!list.length) return 0;
-
-  const store = await getAicuStore();
-  let removed = 0;
-  for (const rpid of list) {
-    if (store.items[rpid]) { delete store.items[rpid]; removed++; }
-  }
-  if (removed) await chrome.storage.local.set({ [K_AICU]: store });
-  return removed;
-}
-
-/** 清单按时间倒序，新的在前 */
-export async function listAicuItems() {
-  const store = await getAicuStore();
-  return Object.keys(store.items)
-    .map(k => store.items[k])
-    .sort((a, b) => (b.ctime || 0) - (a.ctime || 0));
-}
-
-/* -------------------------------------------------------- 评论链接的解析 */
 
 /** 判断是不是 B 站域名 */
 export function isBiliUrl(url) {
@@ -666,6 +596,592 @@ export function fmtTime(ts) {
   const d = new Date(ts);
   const p = n => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+
+/* --------------------------------------------------- 评论库（权威数据源）
+ *
+ * 定位变了：这不再只是「批量删评论」，核心是**本地评论管理 + 备份**，删除只是库里
+ * 众多操作之一。所以数据不能再寄居在收藏夹上 —— 那里只能存标题和 URL，字段贫瘠，
+ * 几千条还会把书签栏塞爆。改为以 chrome.storage.local 里的一份「库」为权威：
+ *
+ *   { v, uid, total, updatedAt, probedAt,
+ *     items:  { rpid: item },
+ *     videos: { "type:oid": { title, bvid, owner, at } } }
+ *
+ * item = { rpid, type, oid, root, rank, message, ctime,
+ *          state,            // live=还在 / gone=已经没了 / deleted=我们自己删的 / unknown=还没查过
+ *          aliveCheckedAt,   // 上次检查存活的时间（毫秒）
+ *          goneAt,           // 哪一刻发现它没了的
+ *          firstSeen, lastSeen,
+ *          bookmarkId }      // 同步到收藏夹时留下的书签 id
+ *
+ * 兼容：老数据存在 bc_aicu 里、只有 alive: true/false/undefined，
+ * 第一次读库时自动迁移过来，不丢东西。
+ */
+
+export const K_LIBRARY = 'bc_library';
+
+const LIB_VERSION = 2;
+const LIB_MAX_ITEMS = 20000;
+
+export const LIB_STATES = ['live', 'gone', 'deleted', 'unknown'];
+
+/** 老字段 alive → 新字段 state */
+export function stateFromAlive(alive) {
+  if (alive === true) return 'live';
+  if (alive === false) return 'gone';
+  return 'unknown';
+}
+
+/** 新字段 state → 老字段 alive（只为了兼容还没改过来的调用方） */
+export function aliveFromState(state) {
+  if (state === 'live') return true;
+  if (state === 'gone') return false;
+  return undefined;
+}
+
+/** 规整库里的一条记录；缺 rpid / type / oid 就返回 null */
+export function normalizeLibItem(raw) {
+  const base = normalizeAicuItem(raw);
+  if (!base) return null;
+
+  let state = String((raw && raw.state) || '').trim();
+  if (LIB_STATES.indexOf(state) < 0) state = stateFromAlive(raw && raw.alive);
+
+  const out = {
+    rpid: base.rpid,
+    type: base.type,
+    oid: base.oid,
+    root: base.root,
+    rank: base.rank,
+    message: base.message,
+    ctime: base.ctime,
+    state: state
+  };
+
+  const ts = v => (Number.isFinite(Number(v)) && Number(v) > 0 ? Math.floor(Number(v)) : 0);
+  if (ts(raw.aliveCheckedAt)) out.aliveCheckedAt = ts(raw.aliveCheckedAt);
+  if (ts(raw.goneAt)) out.goneAt = ts(raw.goneAt);
+  if (ts(raw.deletedAt)) out.deletedAt = ts(raw.deletedAt);
+  if (ts(raw.firstSeen)) out.firstSeen = ts(raw.firstSeen);
+  if (ts(raw.lastSeen)) out.lastSeen = ts(raw.lastSeen);
+  if (raw.bookmarkId) out.bookmarkId = String(raw.bookmarkId);
+
+  // 兼容字段：老代码还在看 alive
+  const a = aliveFromState(state);
+  if (a !== undefined) out.alive = a;
+
+  return out;
+}
+
+function normalizeLib(raw) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const items = {};
+  const inItems = src.items && typeof src.items === 'object' ? src.items : {};
+  let count = 0;
+
+  for (const k of Object.keys(inItems)) {
+    if (count >= LIB_MAX_ITEMS) break;
+    const it = normalizeLibItem(inItems[k]);
+    if (!it) continue;
+    items[it.rpid] = it;
+    count++;
+  }
+
+  const videos = {};
+  const inVideos = src.videos && typeof src.videos === 'object' ? src.videos : {};
+  for (const k of Object.keys(inVideos)) {
+    const v = inVideos[k];
+    if (!v || typeof v !== 'object') continue;
+    videos[k] = {
+      title: String(v.title || '').slice(0, 200),
+      bvid: String(v.bvid || '').slice(0, 20),
+      owner: String(v.owner || '').slice(0, 60),
+      at: Number(v.at) || 0
+    };
+  }
+
+  return {
+    v: LIB_VERSION,
+    uid: String(src.uid || ''),
+    mixed: !!src.mixed,
+    total: Number(src.total) || 0,
+    updatedAt: Number(src.updatedAt) || 0,
+    probedAt: Number(src.probedAt) || 0,
+    items: items,
+    videos: videos
+  };
+}
+
+function emptyLib() {
+  return normalizeLib({});
+}
+
+/** 视频缓存的键 */
+export function videoKey(type, oid) {
+  return String(Number(type)) + ':' + String(oid);
+}
+
+/**
+ * 读整库。第一次读的时候会把老的 bc_aicu 清单迁移过来。
+ * 迁移是"先写库、写成功了才删老键"—— 这样既不会丢数据，也不会让
+ * 「清空导入」被下一次读库的迁移悄悄撤销。
+ */
+export async function getLibrary() {
+  const o = await chrome.storage.local.get(K_LIBRARY);
+  const lib = o[K_LIBRARY];
+  if (lib && typeof lib === 'object' && lib.items) return normalizeLib(lib);
+
+  const legacy = await chrome.storage.local.get(K_AICU);
+  const old = legacy[K_AICU];
+  if (old && old.items) {
+    const migrated = normalizeLib({
+      uid: old.uid, mixed: old.mixed, total: old.total, items: old.items
+    });
+    // 先把库写下去，**确认写成功之后**才删老键。
+    // 留着老键的话，「清空导入」会被下一次读库的迁移悄悄撤销。
+    await chrome.storage.local.set({ [K_LIBRARY]: migrated });
+    await chrome.storage.local.remove(K_AICU);
+    return migrated;
+  }
+  return emptyLib();
+}
+
+export async function saveLibrary(lib) {
+  const next = normalizeLib(lib);
+  next.updatedAt = Date.now();
+  await chrome.storage.local.set({ [K_LIBRARY]: next });
+  return next;
+}
+
+/* ------------------------------------------------------------ 库：写操作 */
+
+/**
+ * 把一批评论并进库（已存在的不重复加，只补全缺失的字段）。
+ * 这是导入 aicu 清单、以及从收藏夹回填时走的入口。
+ */
+export async function upsertLibItems(payload) {
+  const list = Array.isArray(payload) ? payload : ((payload && payload.items) || []);
+  const lib = await getLibrary();
+  const now = Date.now();
+
+  let added = 0;
+  let enriched = 0;
+  let count = Object.keys(lib.items).length;
+
+  for (const raw of list) {
+    const it = normalizeLibItem(raw);
+    if (!it) continue;
+
+    const prev = lib.items[it.rpid];
+    if (prev) {
+      const patch = {};
+      if (!prev.message && it.message) patch.message = it.message;
+      if (!prev.ctime && it.ctime) patch.ctime = it.ctime;
+      if (!prev.type && it.type) patch.type = it.type;
+      if (!prev.oid && it.oid) patch.oid = it.oid;
+      if ((!prev.root || prev.root === '0') && it.root && it.root !== '0') patch.root = it.root;
+      // 已经查过存活结论的，不要被一次重新导入冲掉
+      patch.lastSeen = now;
+      if (Object.keys(patch).length > 1) {
+        lib.items[it.rpid] = Object.assign({}, prev, patch);
+        enriched++;
+      } else {
+        lib.items[it.rpid] = Object.assign({}, prev, { lastSeen: now });
+      }
+      continue;
+    }
+
+    if (count >= LIB_MAX_ITEMS) break;
+    it.firstSeen = it.firstSeen || now;
+    it.lastSeen = now;
+    lib.items[it.rpid] = it;
+    count++;
+    added++;
+  }
+
+  if (payload && payload.uid) {
+    const u = String(payload.uid);
+    if (lib.uid && lib.uid !== u) lib.mixed = true;
+    lib.uid = u;          // 记最新的（老接口就是这个行为，保持一致）
+  }
+  if (payload && Number(payload.total)) lib.total = Number(payload.total);
+
+  if (added || enriched) await saveLibrary(lib);
+  return { added: added, enriched: enriched, total: count, store: lib };
+}
+
+const STATE_SET = { live: 1, gone: 1, deleted: 1, unknown: 1 };
+
+/**
+ * 记下一批存活结论。marks 形如 { rpid: 'live' | 'gone' | 'unknown' }（也接受 true/false）。
+ * 会顺手记下检查时间；**第一次发现它没了的时候**记下 goneAt。
+ */
+export async function setLibStates(marks) {
+  const lib = await getLibrary();
+  const now = Date.now();
+  let changed = 0;   // 结论真的变了的
+  let touched = 0;   // 结论没变、只是刷新了"上次检查时间"的
+
+  for (const rpid of Object.keys(marks || {})) {
+    const it = lib.items[rpid];
+    if (!it) continue;
+
+    const raw = marks[rpid];
+    const state = STATE_SET[raw] ? raw : stateFromAlive(raw);
+    if (it.state === state) {
+      // 结论没变也要更新检查时间，这样才看得出"上次巡检是什么时候"
+      it.aliveCheckedAt = now;
+      touched++;
+      continue;
+    }
+
+    if (state === 'live') {
+      // 又活了（或者之前判错了），把"没了"的痕迹清掉
+      delete it.goneAt;
+    } else if (state === 'gone' && !it.goneAt) {
+      it.goneAt = now;
+    }
+    it.state = state;
+    it.aliveCheckedAt = now;
+    changed++;
+  }
+
+  if (changed || touched) {
+    lib.probedAt = now;
+    await saveLibrary(lib);
+  }
+  return { changed: changed, touched: touched, probedAt: lib.probedAt };
+}
+
+/** 我们自己把它删掉了 */
+export async function markLibDeleted(rpids) {
+  const list = (Array.isArray(rpids) ? rpids : []).map(String);
+  if (!list.length) return 0;
+
+  const lib = await getLibrary();
+  const now = Date.now();
+  let changed = 0;
+  for (const rpid of list) {
+    const it = lib.items[rpid];
+    if (!it) continue;
+    it.state = 'deleted';
+    it.deletedAt = now;
+    it.aliveCheckedAt = now;
+    changed++;
+  }
+  if (changed) await saveLibrary(lib);
+  return changed;
+}
+
+export async function removeLibItems(rpids) {
+  const list = (Array.isArray(rpids) ? rpids : []).map(String);
+  if (!list.length) return 0;
+
+  const lib = await getLibrary();
+  let removed = 0;
+  for (const rpid of list) {
+    if (lib.items[rpid]) { delete lib.items[rpid]; removed++; }
+  }
+  if (removed) await saveLibrary(lib);
+  return removed;
+}
+
+/** 视频标题缓存 */
+export async function saveVideoTitles(map) {
+  const keys = Object.keys(map || {});
+  if (!keys.length) return 0;
+
+  const lib = await getLibrary();
+  const now = Date.now();
+  let n = 0;
+  for (const k of keys) {
+    const v = map[k];
+    if (!v || !v.title) continue;
+    lib.videos[k] = {
+      title: String(v.title).slice(0, 200),
+      bvid: String(v.bvid || '').slice(0, 20),
+      owner: String(v.owner || '').slice(0, 60),
+      at: now
+    };
+    n++;
+  }
+  if (n) await saveLibrary(lib);
+  return n;
+}
+
+/* ------------------------------------------------------------ 库：读操作 */
+
+/** 按时间倒序列出全部条目 */
+export async function listLibItems() {
+  const lib = await getLibrary();
+  return Object.values(lib.items).sort((a, b) => (b.ctime - a.ctime) || (String(b.rpid) > String(a.rpid) ? 1 : -1));
+}
+
+export async function libraryStats() {
+  const lib = await getLibrary();
+  const s = { total: 0, live: 0, gone: 0, deleted: 0, unknown: 0, videos: 0, titled: 0 };
+  const seenVideos = {};
+  for (const k of Object.keys(lib.items)) {
+    const it = lib.items[k];
+    const st = it.state;
+    s.total++;
+    if (s[st] === undefined) s.unknown++; else s[st]++;
+    seenVideos[videoKey(it.type, it.oid)] = 1;
+  }
+  s.videos = Object.keys(seenVideos).length;   // 库里涉及多少个视频
+  s.titled = Object.keys(lib.videos).length;   // 其中多少个已经有标题
+  s.uid = lib.uid;
+  s.mixed = lib.mixed;
+  s.totalOnSite = lib.total;
+  s.probedAt = lib.probedAt;
+  s.updatedAt = lib.updatedAt;
+  return s;
+}
+
+/**
+ * 查库：搜索 / 筛选 / 排序 / 分页。
+ * 分页是必须的 —— 库里几千条，不可能一次塞进 DOM。
+ */
+export async function queryLib(opts) {
+  const o = opts || {};
+  const lib = await getLibrary();
+
+  const q = String(o.q || '').trim().toLowerCase();
+  const states = Array.isArray(o.states) && o.states.length ? o.states : null;
+  const oid = o.oid ? String(o.oid) : '';
+  const sort = o.sort || 'time-desc';
+
+  let list = Object.values(lib.items);
+
+  if (states) list = list.filter(it => states.indexOf(it.state) >= 0);
+  if (oid) list = list.filter(it => String(it.oid) === oid);
+  if (q) {
+    list = list.filter(it =>
+      String(it.message || '').toLowerCase().indexOf(q) >= 0 ||
+      String(it.rpid).indexOf(q) >= 0 ||
+      String(it.oid).indexOf(q) >= 0);
+  }
+
+  const cmp = {
+    'time-desc': (a, b) => (b.ctime - a.ctime),
+    'time-asc': (a, b) => (a.ctime - b.ctime),
+    'video': (a, b) => (String(a.oid) === String(b.oid)
+      ? (b.ctime - a.ctime)
+      : (String(a.oid) < String(b.oid) ? -1 : 1))
+  }[sort];
+  if (cmp) list.sort(cmp);
+
+  const total = list.length;
+  const offset = Math.max(0, Number(o.offset) || 0);
+  const limit = Math.max(1, Math.min(500, Number(o.limit) || 50));
+  const page = list.slice(offset, offset + limit);
+
+  // 顺手把视频标题带上，省得调用方再查一次
+  const withVideo = page.map(it => Object.assign({}, it, {
+    video: lib.videos[videoKey(it.type, it.oid)] || null
+  }));
+
+  return { total: total, offset: offset, limit: limit, items: withVideo, videos: lib.videos };
+}
+
+/** 库里出现过、但还没拿到标题的那些视频 */
+export async function missingVideoTitles(limit) {
+  const lib = await getLibrary();
+  const seen = {};
+  for (const k of Object.keys(lib.items)) {
+    const it = lib.items[k];
+    const key = videoKey(it.type, it.oid);
+    if (!lib.videos[key]) seen[key] = { type: it.type, oid: it.oid };
+  }
+  return Object.keys(seen).slice(0, Math.max(1, Number(limit) || 20)).map(k => seen[k]);
+}
+
+
+
+/* ------------------------------------------------------------------ 导出 */
+
+const esc = s => String(s === undefined || s === null ? '' : s)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+const STATE_TEXT = { live: '还在', gone: '已没了', deleted: '已删除', unknown: '未检查' };
+
+export function stateText(state) {
+  return STATE_TEXT[state] || STATE_TEXT.unknown;
+}
+
+/**
+ * 导出成 JSON —— 完整、无损、能再导回来。
+ * 故意把 videos 也带上：不然导出的库再导入就只剩 av 号了。
+ */
+export async function exportLibraryJSON() {
+  const lib = await getLibrary();
+  const items = Object.keys(lib.items).map(k => lib.items[k]);
+  return JSON.stringify({
+    format: 'bili-comment-keeper/library',
+    version: LIB_VERSION,
+    exportedAt: new Date().toISOString(),
+    uid: lib.uid,
+    mixed: lib.mixed,
+    totalOnSite: lib.total,
+    probedAt: lib.probedAt,
+    count: items.length,
+    videos: lib.videos,
+    items: items
+  }, null, 2);
+}
+
+/** 导出的条目按时间倒序，读起来顺一点 */
+function sortedForExport(lib) {
+  return Object.keys(lib.items)
+    .map(k => lib.items[k])
+    .sort((a, b) => (b.ctime - a.ctime));
+}
+
+function videoOf(lib, it) {
+  return lib.videos[videoKey(it.type, it.oid)] || null;
+}
+
+/**
+ * 导出成一份**能离线打开看**的 HTML。
+ * 这是"定期查看"用的：双击就能在浏览器里翻，不依赖扩展、不联网。
+ */
+export async function exportLibraryHTML(title) {
+  const lib = await getLibrary();
+  const items = sortedForExport(lib);
+  const heading = String(title || ('B 站评论备份 · UID ' + (lib.uid || '未知')));
+
+  const counts = { live: 0, gone: 0, deleted: 0, unknown: 0 };
+  for (const it of items) counts[it.state] = (counts[it.state] || 0) + 1;
+
+  const rows = items.map(it => {
+    const v = videoOf(lib, it);
+    const label = v && v.title ? v.title : (String(it.type) === '1' ? 'av' + it.oid : it.oid);
+    const when = it.ctime ? fmtTime(it.ctime * 1000) : '时间未知';
+    const url = aicuCommentUrl(it);
+    const sub = aicuSubUrl(it);
+    return `<li class="s-${esc(it.state)}">
+      <div class="meta"><span class="when">${esc(when)}</span>
+        <span class="tag t-${esc(it.state)}">${esc(stateText(it.state))}</span>
+        <span class="kind">${esc(aicuTypeName(it.type))}</span>
+        ${it.rank === 2 ? '<span class="kind">楼中楼</span>' : ''}</div>
+      <div class="body">${esc(it.message || '（没有正文）')}</div>
+      <div class="meta"><span class="vid">${esc(label)}</span>
+        ${v && v.owner ? `<span class="owner">UP：${esc(v.owner)}</span>` : ''}
+        <span class="rid">rpid ${esc(it.rpid)}</span></div>
+      <div class="links">
+        ${url ? `<a href="${esc(url)}" target="_blank" rel="noreferrer">方式0</a>` : ''}
+        ${sub ? `<a href="${esc(sub)}" target="_blank" rel="noreferrer">方式2</a>` : ''}
+      </div>
+    </li>`;
+  }).join('\n');
+
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(heading)}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin:0; padding:24px; font:15px/1.7 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+         background:#faf9fb; color:#1c1c22; }
+  @media (prefers-color-scheme: dark) { body { background:#16161a; color:#e6e6ea; } }
+  h1 { font-size:20px; margin:0 0 6px; }
+  .sum { color:#7a7a88; font-size:13px; margin-bottom:18px; }
+  ul { list-style:none; margin:0; padding:0; }
+  li { border:1px solid rgba(128,128,128,.24); border-radius:10px; padding:12px 14px; margin-bottom:10px; }
+  li.s-gone, li.s-deleted { opacity:.55; }
+  .meta { display:flex; flex-wrap:wrap; gap:10px; align-items:center; font-size:12.5px; color:#7a7a88; }
+  .body { margin:6px 0; white-space:pre-wrap; word-break:break-word; }
+  .tag { padding:0 6px; border-radius:4px; font-size:11.5px; border:1px solid currentColor; }
+  .t-live { color:#1a9560; } .t-gone { color:#8a8a96; }
+  .t-deleted { color:#c0392b; } .t-unknown { color:#b8860b; }
+  .links a { margin-right:12px; font-size:13px; }
+  footer { color:#7a7a88; font-size:12px; margin-top:22px; }
+</style>
+</head>
+<body>
+<h1>${esc(heading)}</h1>
+<div class="sum">
+  共 ${items.length} 条　·　还在 ${counts.live || 0}　·　已没了 ${counts.gone || 0}　·　
+  已删除 ${counts.deleted || 0}　·　未检查 ${counts.unknown || 0}<br>
+  导出时间 ${esc(fmtTime(Date.now()))}
+</div>
+<ul>
+${rows}
+</ul>
+<footer>由 B站评论管家 导出。这份文件是自包含的，不联网也能看。</footer>
+</body>
+</html>`;
+}
+
+/** 导出成 Markdown —— 便于丢进笔记软件、或者拿去 diff */
+export async function exportLibraryMarkdown(title) {
+  const lib = await getLibrary();
+  const items = sortedForExport(lib);
+  const heading = String(title || ('B 站评论备份 · UID ' + (lib.uid || '未知')));
+
+  const counts = { live: 0, gone: 0, deleted: 0, unknown: 0 };
+  for (const it of items) counts[it.state] = (counts[it.state] || 0) + 1;
+
+  const lines = [
+    '# ' + heading,
+    '',
+    `共 ${items.length} 条　·　还在 ${counts.live || 0}　·　已没了 ${counts.gone || 0}　·　` +
+      `已删除 ${counts.deleted || 0}　·　未检查 ${counts.unknown || 0}`,
+    '',
+    `导出时间：${fmtTime(Date.now())}`,
+    ''
+  ];
+
+  for (const it of items) {
+    const v = videoOf(lib, it);
+    const label = v && v.title ? v.title : (String(it.type) === '1' ? 'av' + it.oid : it.oid);
+    const when = it.ctime ? fmtTime(it.ctime * 1000) : '时间未知';
+    const url = aicuCommentUrl(it);
+    const sub = aicuSubUrl(it);
+
+    lines.push('## ' + when + '　' + stateText(it.state));
+    lines.push('');
+    lines.push('> ' + String(it.message || '（没有正文）').replace(/\n/g, '\n> '));
+    lines.push('');
+    lines.push(`- ${aicuTypeName(it.type)}${it.rank === 2 ? '（楼中楼）' : ''}：${label}` +
+      (v && v.owner ? `　UP：${v.owner}` : ''));
+    lines.push(`- rpid \`${it.rpid}\``);
+    if (url) lines.push(`- [方式0](${url})`);
+    if (sub) lines.push(`- [方式2](${sub})`);
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * 把导出的 JSON 读回库。
+ * 只认识我们自己导出的格式；条目走和导入一样的合并逻辑（不覆盖已有的存活结论）。
+ */
+export async function importLibraryJSON(text) {
+  let data;
+  try { data = JSON.parse(text); } catch (e) { return { ok: false, reason: '不是合法的 JSON' }; }
+  if (!data || !Array.isArray(data.items)) return { ok: false, reason: '这不是评论库的备份文件（缺少 items）' };
+
+  const r = await upsertLibItems({ uid: data.uid, total: data.totalOnSite, items: data.items });
+
+  let videos = 0;
+  if (data.videos && typeof data.videos === 'object') {
+    videos = await saveVideoTitles(data.videos);
+  }
+  // 备份里的存活结论也要认，否则导回来全变成"未检查"
+  const marks = {};
+  for (const it of data.items) {
+    if (it && it.rpid && it.state) marks[it.rpid] = it.state;
+  }
+  if (Object.keys(marks).length) await setLibStates(marks);
+
+  return { ok: true, added: r.added, enriched: r.enriched, total: r.total, videos: videos };
 }
 
 /* ------------------------------------------------------------------ 杂项 */
