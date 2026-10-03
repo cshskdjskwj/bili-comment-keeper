@@ -7,7 +7,7 @@
  */
 
 import {
-  getSettings, getIndex, setIndex, ensureFolder, parseCommentUrl, listBookmarks,
+  getSettings, getIndex, ensureFolder, parseCommentUrl, listBookmarks,
   sleep, randInt, escapeHtml, explainCode, sourceLabel, fmtTime, folderPath
 } from '../src/shared.js';
 
@@ -435,8 +435,16 @@ async function deleteWithRecovery(target) {
 
   if (r.tabGone) {
     log('  ↻ 请求通道标签页已失效，正在换一个…');
+
+    // 注入失败不一定是因为标签页被关了（也可能是那个页面被导航去了别的站点），
+    // 所以别急着丢掉记录：如果当前用的正是我们自己开的临时标签页，先把它收掉，
+    // 否则重新 acquire 之后就再也认不出它，会白白留在后台。
+    if (workerCreated && workerTabId !== null) {
+      try { await chrome.tabs.remove(workerTabId); } catch (e) { /* 早就没了 */ }
+    }
     workerTabId = null;
     workerCreated = false;
+
     tabId = await acquireWorkerTab();
     r = await deleteOne(tabId, target);
   }
@@ -469,25 +477,25 @@ async function refreshBadge() {
 
 /**
  * 把已删除的 rpid 交回后台清索引。
- * 面板刻意不做「整体写回」：那会用打开面板时的旧快照，覆盖掉删除期间后台新记进来的条目。
- * 后台联系不上时退化成现读现写，只删这几个键，语义上依然安全。
+ * 面板**刻意不做整体写回**：那会用打开面板时的旧快照，覆盖掉删除期间后台
+ * 新记进来的条目，正是这一版要修掉的问题。所以这里只会重试消息，
+ * 绝不退化成"自己 getIndex -> setIndex"。
  */
 async function forgetRpids(rpids) {
   if (!rpids.length) return;
 
-  try {
-    await chrome.runtime.sendMessage({ type: 'FORGET_RPIDS', rpids: rpids });
-    return;
-  } catch (e) { /* 后台可能刚好休眠，下面自己来 */ }
-
-  try {
-    const index = await getIndex();
-    let changed = false;
-    for (const rpid of rpids) {
-      if (Object.prototype.hasOwnProperty.call(index, rpid)) { delete index[rpid]; changed = true; }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await chrome.runtime.sendMessage({ type: 'FORGET_RPIDS', rpids: rpids });
+      return;
+    } catch (e) {
+      if (attempt < 2) await sleep(300 * (attempt + 1));
     }
-    if (changed) await setIndex(index);
-  } catch (e) { /* 索引里留个孤儿项无害，下次记录同一条时会自动修正 */ }
+  }
+
+  // 实在联系不上就放弃。残留的索引项无害：删除时会按 rpid 扫书签目录，
+  // 而且真删过的话接口会返回 12022，一样能归档。
+  log('  ！后台没应答，索引里会留下几条失效记录（无副作用，可忽略）');
 }
 
 /* ------------------------------------------------------------------ 主流程 */

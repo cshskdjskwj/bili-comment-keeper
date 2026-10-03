@@ -28,7 +28,8 @@ export const K_SYNC_STATE = 'bc_sync_state';   // 上次云备份成功与否，
  * 于是「换设备记录自动回来」这条卖点悄悄失效了。现在按字节数分片，并把结果落进
  * K_SYNC_STATE，让设置页能如实告诉用户备份到底成没成。 */
 const SYNC_CHUNK_BUDGET = 7000;   // 每片留出余量，不贴着 8192 走
-const SYNC_TOTAL_LIMIT = 100000;  // 102400 是硬上限，留出键名与元信息的余量
+const SYNC_HARD_LIMIT = 102400;   // chrome.storage.sync 的 QUOTA_BYTES 硬上限
+const SYNC_TOTAL_LIMIT = 100000;  // 预检阈值：给分片键名、meta 和其它键留出余量
 const SYNC_BACKOFF_MS = 60000;    // 备份失败后 1 分钟内不再重试，免得反复撞配额
 
 const textEncoder = new TextEncoder();
@@ -160,8 +161,11 @@ async function writeSyncIndex(index) {
   const bytes = chunks.reduce((n, c) => n + utf8Bytes(JSON.stringify(c)), 0);
 
   if (bytes > SYNC_TOTAL_LIMIT) {
-    throw new Error('索引 ' + count + ' 条约 ' + bytes + ' 字节，超过云同步 ' +
-      SYNC_TOTAL_LIMIT + ' 字节总量上限');
+    // 说清楚哪个数字是 Chrome 的硬上限、哪个是本扩展自己留的余量，
+    // 免得用户把这个数字当成平台配额。
+    throw new Error('索引 ' + count + ' 条约 ' + bytes + ' 字节，超过云同步容量' +
+      '（Chrome 上限 ' + SYNC_HARD_LIMIT + ' 字节，扣掉分片键名等开销后按 ' +
+      SYNC_TOTAL_LIMIT + ' 字节预检）');
   }
 
   const oldBox = await chrome.storage.sync.get(K_SYNC_META).catch(() => null);

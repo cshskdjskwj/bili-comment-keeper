@@ -195,6 +195,15 @@ await test('1500 条记录分片后能完整往返（清掉本地也能从云备
   assert.ok(syncArea._data.has(K_SYNC_META), '应该写入了分片元信息');
   assert.ok(syncArea._chunkKeys().length > 1, '1500 条不可能只占一片');
 
+  // 口径说明：这个桩按 UTF-8 字节计量，而 Chrome 的配额口径历来是字符串长度
+  // （UTF-16 码元）。二者只对本项目这种「纯 ASCII 的 rpid / oid / type」备份数据
+  // 恰好相等 —— 下面这条断言把这个前提钉住：哪天备份里混进 emoji 之类增补平面
+  // 字符，它会立刻失败，提醒重新核对口径。
+  for (const [k, raw] of syncArea._data) {
+    assert.equal(Buffer.byteLength(raw, 'utf8'), raw.length,
+      `备份数据的字节口径假设被打破（键 ${k}）`);
+  }
+
   // 模拟「换了台设备 / 扩展被重装」：本地清空，只留云备份
   await chrome.storage.local.remove(K_INDEX);
   const restored = await getIndex();
@@ -253,19 +262,55 @@ await test('索引变小后，多余的旧分片会被清掉', async () => {
   assert.deepEqual(await getIndex(), expectedRecovered(makeIndex(3)), '缩小后恢复出来的应是最新内容');
 });
 
-// 放在最后：这一步会触发失败退避，不该影响前面的用例
-await test('真撞上总量上限时如实报错，不再假装成功（v1.0.0 正是静默吞掉）', async () => {
-  const idx = makeIndex(4000);          // 精简后仍然超过 102400 字节
+await test('没有 oid/type 的条目不会进云备份，也不计入备份条数', async () => {
+  // 剪贴板兜底路径写死 type/oid 为 null（src/recorder-main.js），
+  // 这类条目对删除毫无帮助，备份里留着只是白占配额。
+  const idx = makeIndex(3);
+  idx['9999000011112222'] = {
+    url: 'https://www.bilibili.com/video/BV1xx411c7mD?comment_on=1&comment_root_id=9999000011112222&share_tag=s_i#reply9999000011112222',
+    rpid: '9999000011112222', root: '0', secondaryId: '', isSecondary: false,
+    bvid: 'BV1xx411c7mD', pageUrl: 'https://www.bilibili.com/video/BV1xx411c7mD',
+    type: null, oid: null, message: '', ctime: 1791000000, source: 'clipboard',
+    title: '[2026-10-04 02:24] BV1xx411c7mD · 评论', bookmarkId: '777',
+    addedAt: 1791000000000
+  };
+
   await setIndex(idx);
   await flushTimers();
 
   const state = await getSyncState();
+  assert.equal(state.ok, true, '这种数据不该导致备份失败');
+  assert.equal(state.count, 3, `备份条数不该把无 oid/type 的条目算进去，实际 ${state.count}`);
+
+  await chrome.storage.local.remove(K_INDEX);
+  const restored = await getIndex();
+  assert.deepEqual(restored, expectedRecovered(makeIndex(3)), '恢复出来的应该只有那 3 条有元数据的');
+});
+
+// 放在最后：这一步会触发失败退避，不该影响前面的用例
+await test('真撞上总量上限时如实报错，且不破坏上一版备份', async () => {
+  // 先成功写一批，作为"上一版备份"
+  await setIndex(makeIndex(100));
+  await flushTimers();
+  assert.ok(syncArea._data.has(K_SYNC_META), '上一版备份应该写成功了');
+  const before = [...syncArea._data.entries()].map(([k, v]) => k + '=' + v).sort();
+
+  // 再写一批超总量的
+  const huge = makeIndex(4000);          // 精简后仍然超过预检阈值
+  await setIndex(huge);
+  await flushTimers();
+
+  const after = [...syncArea._data.entries()].map(([k, v]) => k + '=' + v).sort();
+  assert.deepEqual(after, before, '写入失败不该动到上一版备份的任何一个字节');
+
+  const state = await getSyncState();
   assert.ok(state, '应该留下一条备份状态');
   assert.equal(state.ok, false, '超配额时必须标记为失败');
-  assert.match(state.reason, /总量上限|quota/i, `失败原因应说明是容量问题，实际：${state.reason}`);
+  assert.match(state.reason, /容量|quota/i, `失败原因应说明是容量问题，实际：${state.reason}`);
+  assert.match(state.reason, /102400/, `失败原因应给出 Chrome 的真实上限，实际：${state.reason}`);
 
   // 关键：云备份失败绝不能连累本地索引
-  assert.deepEqual(await getIndex(), idx, '云备份失败不该影响本地索引');
+  assert.deepEqual(await getIndex(), huge, '云备份失败不该影响本地索引');
 });
 
 /* ---------------------------------------------------------------- 汇总 */
